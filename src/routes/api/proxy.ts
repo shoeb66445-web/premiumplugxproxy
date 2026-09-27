@@ -27,6 +27,12 @@ const SONY_UA =
 const SONY_ORIGIN = 'https://www.sonyliv.com'
 const SONY_REFERER = 'https://www.sonyliv.com/'
 
+/* Hotstar's mobile UA is required by jcevents.hotstar.com segments — jcevents
+   returns 403 to a desktop UA even with a valid token. */
+const HOTSTAR_UA = 'Hotstar;in.startv.hotstar/25.02.24.8.11169@Premium Plugx(Android/15)'
+const HOTSTAR_ORIGIN = 'https://www.hotstar.com'
+const HOTSTAR_REFERER = 'https://www.hotstar.com/'
+
 /* Only these hosts — prevents this from acting as an open relay. */
 const ALLOWED = [
   'slivcdn.com', // Dish/SonyLiv: dishmt.slivcdn.com, dishmt2, slivevents…
@@ -41,8 +47,19 @@ const ALLOWED = [
 /* Hosts that answer better with the SonyLiv identity than a bare fetch. */
 const SONY_HOSTS = ['slivcdn.com', 'sonydaimenew.akamaized.net']
 
+/* Hotstar CDN hosts that demand the mobile app UA — a desktop UA gets a 403
+   regardless of the cookie or token. */
+const HOTSTAR_MOBILE_UA_HOSTS = [
+  'jcevents.hotstar.com', // JioHotstar live event HLS
+  'livetv.hotstar.com', // Star/Disney channels
+  'live09p.hotstar.com', // 24/7 feeds
+]
+
 const allowed = (h: string) => ALLOWED.some((s) => h === s || h.endsWith('.' + s))
 const isSonyHost = (h: string) => SONY_HOSTS.some((s) => h === s || h.endsWith('.' + s))
+const isHotstarHost = (h: string) => h === 'hotstar.com' || h.endsWith('.hotstar.com')
+const needsHotstarMobileUA = (h: string) =>
+  HOTSTAR_MOBILE_UA_HOSTS.some((s) => h === s || h.endsWith('.' + s))
 
 function corsHeaders() {
   return {
