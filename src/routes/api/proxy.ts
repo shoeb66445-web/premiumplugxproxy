@@ -129,6 +129,16 @@ async function handleProxy(request: Request) {
     effectiveUA = ua || SONY_UA
     effectiveRef = ref || SONY_REFERER
     effectiveOrigin = SONY_ORIGIN
+  } else if (needsHotstarMobileUA(targetUrl.hostname)) {
+    effectiveUA = ua || HOTSTAR_UA
+    effectiveRef = ref || HOTSTAR_REFERER
+    effectiveOrigin = HOTSTAR_ORIGIN
+  } else if (isHotstarHost(targetUrl.hostname)) {
+    /* Other Hotstar subdomains — hotstar.com origin still required, desktop
+       UA acceptable. */
+    effectiveUA = ua || DEFAULT_UA
+    effectiveRef = ref || HOTSTAR_REFERER
+    effectiveOrigin = HOTSTAR_ORIGIN
   } else {
     effectiveUA = ua || DEFAULT_UA
     let refOrigin = targetUrl.origin
