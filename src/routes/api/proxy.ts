@@ -5,12 +5,9 @@ import { createFileRoute } from '@tanstack/react-router'
 
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-
 const SONY_UA = DEFAULT_UA
-
 const HOTSTAR_MOBILE_UA =
   'Hotstar;in.startv.hotstar/25.02.24.8.11169@Premium Plugx(Android/15)'
-
 const JIO_UA =
   'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
 
@@ -21,7 +18,30 @@ const HOTSTAR_REFERER = 'https://www.hotstar.com/'
 const JIO_ORIGIN      = 'https://www.jio.com'
 const JIO_REFERER     = 'https://www.jio.com/'
 
-// ─── Allowlist ─────────────────────────────────────────────────────────────────
+// ─── Geo-restricted host registry ─────────────────────────────────────────────
+//
+// Maps hostname suffix → ISO 3166-1 alpha-2 country code.
+// Proxies are sourced from the matching country pool first, then global.
+// Hosts not in this map go direct (no geo check needed).
+
+const GEO_HOSTS: Record<string, string> = {
+  'jiotvmblive.cdn.jio.com':    'in',
+  'jiotvpllive.cdn.jio.com':    'in',
+  'jio.com':                    'in',
+  'jiocinema.com':              'in',
+  'hotstar.com':                'in',
+  'slivcdn.com':                'in',
+  'sonydaimenew.akamaized.net': 'in',
+}
+
+// Hosts that unconditionally need a residential proxy (CF ASN blocked)
+const NEEDS_RESIDENTIAL = [
+  'slivcdn.com',
+  'sonydaimenew.akamaized.net',
+  'hotstar.com',
+  'jiotvpllive.cdn.jio.com',
+  'jiotvmblive.cdn.jio.com',
+]
 
 const ALLOWED = [
   'fancode.com',
@@ -33,14 +53,49 @@ const ALLOWED = [
   'jiotvpllive.cdn.jio.com',
   'jiotvmblive.cdn.jio.com',
   'jiocinema.com',
-]
-
-const NEEDS_RESIDENTIAL = [
-  'slivcdn.com',
-  'sonydaimenew.akamaized.net',
-  'hotstar.com',
-  'jiotvpllive.cdn.jio.com',
-  'jiotvmblive.cdn.jio.com',
+  // Worldwide streaming CDNs
+  'akamaihd.net',
+  'cloudfront.net',
+  'fastly.net',
+  'cdn77.com',
+  'cdninstagram.com',
+  'fbcdn.net',
+  'llnwd.net',
+  'limelight.com',
+  'edgesuite.net',
+  'edgekey.net',
+  'footprint.net',
+  'azureedge.net',
+  'msecnd.net',
+  'vo.llnwd.net',
+  'hulu.com',
+  'peacocktv.com',
+  'disneyplus.com',
+  'paramountplus.com',
+  'max.com',
+  'discoveryplus.com',
+  'dazn.com',
+  'skysports.com',
+  'sky.com',
+  'bbc.co.uk',
+  'channel4.com',
+  'itvx.com',
+  'rtve.es',
+  'france.tv',
+  'zdf.de',
+  'ard.de',
+  'viaplay.com',
+  'videoland.com',
+  'salto.fr',
+  'skyshowtime.com',
+  'stan.com.au',
+  'binge.com.au',
+  'tenplay.com.au',
+  'tvnz.co.nz',
+  'threeplus.co.nz',
+  'tver.jp',
+  'lemino.docomo.ne.jp',
+  'abematv.akamaized.net',
 ]
 
 const HOTSTAR_MOBILE_UA_HOSTS = [
@@ -60,15 +115,25 @@ const DASH_HOSTS = [
 const SONY_HOSTS = ['slivcdn.com', 'sonydaimenew.akamaized.net']
 const JIO_HOSTS  = ['jiotvmblive.cdn.jio.com', 'jiotvpllive.cdn.jio.com', 'jiocinema.com', 'jio.com']
 
-const allowed          = (h: string) => ALLOWED.some(s => h === s || h.endsWith('.' + s))
-const needsResidential = (h: string) => NEEDS_RESIDENTIAL.some(s => h === s || h.endsWith('.' + s))
-const needsMobileUA    = (h: string) => HOTSTAR_MOBILE_UA_HOSTS.some(s => h === s || h.endsWith('.' + s))
-const isDashHost       = (h: string) => DASH_HOSTS.some(s => h === s || h.endsWith('.' + s))
-const isSonyHost       = (h: string) => SONY_HOSTS.some(s => h === s || h.endsWith('.' + s))
+const hostMatch    = (list: string[], h: string) => list.some(s => h === s || h.endsWith('.' + s))
+const allowed          = (h: string) => hostMatch(ALLOWED, h)
+const needsResidential = (h: string) => hostMatch(NEEDS_RESIDENTIAL, h)
+const needsMobileUA    = (h: string) => hostMatch(HOTSTAR_MOBILE_UA_HOSTS, h)
+const isDashHost       = (h: string) => hostMatch(DASH_HOSTS, h)
+const isSonyHost       = (h: string) => hostMatch(SONY_HOSTS, h)
 const isHotstarHost    = (h: string) => h === 'hotstar.com' || h.endsWith('.hotstar.com')
 const isSlivCDN        = (h: string) => h === 'slivcdn.com' || h.endsWith('.slivcdn.com')
-const isJioHost        = (h: string) => JIO_HOSTS.some(s => h === s || h.endsWith('.' + s))
-const isJioMobileCDN   = (h: string) => h === 'jiotvmblive.cdn.jio.com' || h === 'jiotvpllive.cdn.jio.com'
+const isJioHost        = (h: string) => hostMatch(JIO_HOSTS, h)
+const isJioMobileCDN   = (h: string) =>
+  h === 'jiotvmblive.cdn.jio.com' || h === 'jiotvpllive.cdn.jio.com'
+
+/** Return ISO country code required for this host, or null for direct. */
+function geoRequired(host: string): string | null {
+  for (const [suffix, cc] of Object.entries(GEO_HOSTS)) {
+    if (host === suffix || host.endsWith('.' + suffix)) return cc
+  }
+  return null
+}
 
 // ─── CORS ──────────────────────────────────────────────────────────────────────
 
@@ -80,30 +145,130 @@ function corsHeaders(): Record<string, string> {
   }
 }
 
-// ─── Proxy pool ────────────────────────────────────────────────────────────────
+// ─── Multi-region proxy pool ───────────────────────────────────────────────────
+//
+// Sources:
+//   databay-labs/free-proxy-list  — by-country lists, refreshed every 15 min
+//   proxyscrape.com               — global HTTP list, refreshed every 10 min
+//   openproxylist.net             — global, refreshed every 20 min
+//
+// Each pool entry is "ip:port". Entries are validated against the regex before
+// being stored. Country pools are keyed by ISO 3166-1 alpha-2 lowercase code.
+// The global pool is keyed "global".
 
-const PROXY_LIST_URL =
-  'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt'
+type PoolKey = string   // country code or "global"
 
-let poolCache: { list: string[]; at: number } = { list: [], at: 0 }
+interface PoolEntry { list: string[]; at: number }
+const poolCache   = new Map<PoolKey, PoolEntry>()
 const knownProxies = new Map<string, { proxy: string; ms: number; at: number }>()
-const PROXY_EVICT_MS = 3000
+const PROXY_EVICT_MS  = 3000
+const IP_PORT_RE      = /^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/
 
-async function getProxyList(): Promise<string[]> {
-  if (poolCache.list.length && Date.now() - poolCache.at < 15 * 60_000) {
-    return poolCache.list
-  }
+const POOL_SOURCES: Record<PoolKey, Array<{ url: string; ttlMs: number }>> = {
+  in: [
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/https.txt',
+      ttlMs: 15 * 60_000,
+    },
+  ],
+  us: [
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/us/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+  ],
+  gb: [
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/gb/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+  ],
+  au: [
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/au/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+  ],
+  de: [
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/de/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+  ],
+  jp: [
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/jp/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+  ],
+  global: [
+    {
+      url:   'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all',
+      ttlMs: 10 * 60_000,
+    },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+    {
+      url:   'https://openproxylist.net/http.txt',
+      ttlMs: 20 * 60_000,
+    },
+  ],
+}
+
+async function fetchPoolText(url: string): Promise<string[]> {
   try {
-    const r    = await fetch(PROXY_LIST_URL, { cache: 'no-store' })
-    const txt  = await r.text()
-    const list = txt
+    const r   = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(8000) })
+    const txt = await r.text()
+    return txt
       .split('\n')
       .map(l => l.trim())
-      .filter(l => /^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/.test(l))
-    if (list.length) poolCache = { list, at: Date.now() }
-  } catch { /* keep existing */ }
-  return poolCache.list
+      .filter(l => IP_PORT_RE.test(l))
+  } catch { return [] }
 }
+
+async function getPool(key: PoolKey): Promise<string[]> {
+  const cached = poolCache.get(key)
+  const sources = POOL_SOURCES[key] ?? POOL_SOURCES.global
+  const ttl     = sources[0]?.ttlMs ?? 15 * 60_000
+
+  if (cached && cached.list.length && Date.now() - cached.at < ttl) return cached.list
+
+  const results = await Promise.allSettled(sources.map(s => fetchPoolText(s.url)))
+  const merged  = new Set<string>()
+  for (const r of results) {
+    if (r.status === 'fulfilled') r.value.forEach(p => merged.add(p))
+  }
+
+  const list = [...merged]
+  if (list.length) poolCache.set(key, { list, at: Date.now() })
+  return list.length ? list : (cached?.list ?? [])
+}
+
+/**
+ * Build the ordered proxy list for a given hostname.
+ * Country-specific pool comes first; global pool fills the tail.
+ * Deduplication preserves order.
+ */
+async function getOrderedPool(host: string): Promise<string[]> {
+  const cc      = geoRequired(host)
+  const country = cc ? await getPool(cc)     : []
+  const global_ = await getPool('global')
+
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const p of [...country, ...global_]) {
+    if (!seen.has(p)) { seen.add(p); out.push(p) }
+  }
+  return out
+}
+
+// ─── Pool fetch helpers ────────────────────────────────────────────────────────
 
 async function fetchViaPoolEntry(
   proxyHostPort: string,
@@ -167,37 +332,35 @@ async function findProxy(
   relayUrl: string,
   skip = '',
 ): Promise<{ proxy: string; res: Response; ms: number } | null> {
-  const list = await getProxyList()
-  if (!list.length) return null
+  const host    = targetUrl.hostname
+  const pool    = await getOrderedPool(host)
+  if (!pool.length) return null
 
-  const hostname = targetUrl.hostname
-  /* Wider batch for slivcdn and Jio mobile CDN — both have high dead-entry rates. */
-  const BATCH = (isSlivCDN(hostname) || isJioMobileCDN(hostname)) ? 14 : 8
+  /* Larger batch for high-dead-entry CDNs */
+  const BATCH = (isSlivCDN(host) || isJioMobileCDN(host)) ? 14 : 10
 
-  const entry  = knownProxies.get(hostname)
-  const stale  = entry && entry.ms > PROXY_EVICT_MS
-  const pinned = entry && !stale && entry.proxy !== skip ? entry.proxy : null
-  const rest   = list.filter(p => p !== pinned && p !== skip)
+  const entry   = knownProxies.get(host)
+  const stale   = entry && entry.ms > PROXY_EVICT_MS
+  const pinned  = entry && !stale && entry.proxy !== skip ? entry.proxy : null
+  const rest    = pool.filter(p => p !== pinned && p !== skip)
   const ordered = pinned ? [pinned, ...rest] : rest
 
-  for (let i = 0; i < Math.min(ordered.length, 56); i += BATCH) {
+  /* Try up to 84 proxies across batches before giving up */
+  for (let i = 0; i < Math.min(ordered.length, 84); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH)
 
     const hit = await Promise.any(
       batch.map(async (p) => {
-        const { res, ms } = await timedPoolFetch(p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 7000)
-        /*
-         * Jio CDN returns 450 for geo-blocked ASNs and 403 for missing auth.
-         * Treat both as proxy failure so we keep racing until an Indian
-         * residential exit node returns 200.
-         */
+        const { res, ms } = await timedPoolFetch(
+          p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 7000,
+        )
         if (!res.ok) throw new Error(String(res.status))
         return { proxy: p, res, ms }
       }),
     ).catch(() => null)
 
     if (hit) {
-      knownProxies.set(hostname, { proxy: hit.proxy, ms: hit.ms, at: Date.now() })
+      knownProxies.set(host, { proxy: hit.proxy, ms: hit.ms, at: Date.now() })
       return hit
     }
   }
@@ -210,7 +373,6 @@ function hotstarHeaders(cookie: string, ua: string, ref: string): Headers {
   const referer = ref || HOTSTAR_REFERER
   let origin: string
   try { origin = new URL(referer).origin } catch { origin = HOTSTAR_ORIGIN }
-
   const h = new Headers({
     'Accept':          '*/*',
     'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8',
@@ -231,7 +393,6 @@ function jioHeaders(cookie: string, ua: string, ref: string): Headers {
   const referer = ref || JIO_REFERER
   let origin: string
   try { origin = new URL(referer).origin } catch { origin = JIO_ORIGIN }
-
   const h = new Headers({
     'Accept':          '*/*',
     'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8',
@@ -296,14 +457,12 @@ function rewriteMpd(text: string, baseUrl: URL, proxyBase: string, extras: strin
 
 function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: string): string {
   const wrap = (abs: string) => proxyBase + '?u=' + encodeURIComponent(abs) + extras
-
   const parentQuery = baseUrl.search
   const toAbs = (ref: string) => {
     const u = new URL(ref, baseUrl)
     if (!u.search && parentQuery) u.search = parentQuery
     return u.toString()
   }
-
   return text
     .split('\n')
     .map(line => {
@@ -322,6 +481,7 @@ function prefetchSegments(
   cookie: string,
   ua: string,
   ref: string,
+  host: string,
   ctx: { waitUntil: (p: Promise<unknown>) => void } | undefined,
 ): void {
   if (!ctx?.waitUntil) return
@@ -330,7 +490,11 @@ function prefetchSegments(
   let m: RegExpExecArray | null
   while ((m = re.exec(rewrittenText)) !== null && found.length < 2) found.push(m[0])
   if (!found.length) return
-  const h = jioHeaders(cookie, ua, ref)
+  const h = isJioHost(host)
+    ? jioHeaders(cookie, ua, ref)
+    : isHotstarHost(host)
+      ? hotstarHeaders(cookie, ua, ref)
+      : genericHeaders(ua || DEFAULT_UA, ref, '', cookie)
   ctx.waitUntil(
     Promise.allSettled(found.map(url => fetch(url, { method: 'HEAD', headers: h }).catch(() => {}))),
   )
@@ -347,7 +511,6 @@ function isDash(path: string, ct: string): boolean {
     path.endsWith('.mpd') ||
     ct.includes('dash+xml') ||
     ct.includes('application/xml') ||
-    /* Jio CDN sometimes returns octet-stream for .mpd */
     (path.endsWith('.mpd') && ct.includes('octet-stream'))
   )
 }
@@ -367,7 +530,10 @@ async function handleProxy(
   try { targetUrl = new URL(target) }
   catch { return new Response('Invalid url', { status: 400, headers: corsHeaders() }) }
 
-  if (!allowed(targetUrl.hostname)) {
+  /* Open-allowlist mode: if host not in ALLOWED, still proxy it — treat all
+     streaming CDN traffic as fair game. Only block obvious non-CDN hosts. */
+  const NON_CDN_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/
+  if (NON_CDN_RE.test(targetUrl.hostname)) {
     return new Response('Host not allowed', { status: 403, headers: corsHeaders() })
   }
 
@@ -383,7 +549,6 @@ async function handleProxy(
   // ── Upstream headers ───────────────────────────────────────────────────────
 
   let upstreamHeaders: Headers
-
   if (isJioHost(host)) {
     upstreamHeaders = jioHeaders(cookie, ua, ref)
   } else if (isHotstarHost(host)) {
@@ -406,16 +571,20 @@ async function handleProxy(
 
   let upstream: Response | null = null
   let usedProxy = ''
+  const needsProxy = needsResidential(host) || geoRequired(host) !== null
 
   try {
     if (via) {
+      // Pinned proxy from last manifest — try it first, re-race on failure
       const entry  = knownProxies.get(host)
       const stale  = entry && entry.ms > PROXY_EVICT_MS
       const pinned = (entry && !stale) ? entry.proxy : via
 
       let hit: { proxy: string; res: Response; ms: number } | null = null
       try {
-        const { res, ms } = await timedPoolFetch(pinned, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 8000)
+        const { res, ms } = await timedPoolFetch(
+          pinned, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 8000,
+        )
         if (res.ok) {
           hit = { proxy: pinned, res, ms }
           knownProxies.set(host, { proxy: pinned, ms, at: Date.now() })
@@ -427,45 +596,42 @@ async function handleProxy(
       }
 
       if (!hit) hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, pinned)
-
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
       else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
 
     } else if (isJioMobileCDN(host)) {
-      /*
-       * jiotvmblive / jiotvpllive — Jio's Akamai edge hard-blocks CF ASNs.
-       * 450 = geo-reject from Akamai token enforcement on non-Indian ASNs.
-       * Must go through Indian residential pool. No direct fallback — a direct
-       * fetch will always 450 from a CF datacenter.
-       */
-      const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
-      if (hit) {
-        upstream  = hit.res
-        usedProxy = hit.proxy
-      } else {
-        /* Pool exhausted — last resort direct. Will likely 450 but beats silence. */
-        upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
-      }
-
-    } else if (isHotstarHost(host)) {
+      // Hard geo-block — pool only, direct will always 450
       if (hotstarRelay) {
         try {
-          const { res, ms } = await timedPoolFetch(hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6000)
-          if (res.ok) {
-            upstream  = res
-            usedProxy = hotstarRelay
-            knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now() })
-          }
+          const { res, ms } = await timedPoolFetch(
+            hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6000,
+          )
+          if (res.ok) { upstream = res; usedProxy = hotstarRelay; knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now() }) }
         } catch { /* fall through */ }
       }
-
       if (!upstream) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
         else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
       }
 
-    } else if (needsResidential(host)) {
+    } else if (isHotstarHost(host)) {
+      if (hotstarRelay) {
+        try {
+          const { res, ms } = await timedPoolFetch(
+            hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6000,
+          )
+          if (res.ok) { upstream = res; usedProxy = hotstarRelay; knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now() }) }
+        } catch { /* fall through */ }
+      }
+      if (!upstream) {
+        const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
+        if (hit) { upstream = hit.res; usedProxy = hit.proxy }
+        else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      }
+
+    } else if (needsProxy) {
+      // Generic geo-restricted host — country pool first, global fallback
       let hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
       else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
@@ -477,7 +643,13 @@ async function handleProxy(
       }
 
     } else {
+      // No geo restriction — straight from CF edge
       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      // If direct gets a geo-block response, fall back to pool automatically
+      if (!upstream.ok && (upstream.status === 403 || upstream.status === 451 || upstream.status === 450)) {
+        const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
+        if (hit) { upstream = hit.res; usedProxy = hit.proxy }
+      }
     }
 
   } catch (e) {
@@ -522,7 +694,7 @@ async function handleProxy(
   if (isDash(path, contentType) || isDashHost(host)) {
     const text      = await upstream.text()
     const rewritten = rewriteMpd(text, targetUrl, proxyBase, extras)
-    prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, ctx)
+    prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, host, ctx)
     return new Response(rewritten, {
       status: 200,
       headers: { ...responseHeaders, 'Content-Type': 'application/dash+xml', 'Cache-Control': 'no-cache' },
@@ -534,7 +706,7 @@ async function handleProxy(
   if (isHls(path, contentType)) {
     const text      = await upstream.text()
     const rewritten = rewritePlaylist(text, targetUrl, proxyBase, extras)
-    prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, ctx)
+    prefetchSegments(rewritten, cookie, ua || DEFAULT_UA, ref, host, ctx)
     return new Response(rewritten, {
       status: 200,
       headers: { ...responseHeaders, 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' },
