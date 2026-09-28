@@ -40,7 +40,7 @@ const ALLOWED = [
   'akamaihd.net',
   'fancode.com',
   'hotstar.com',
-  'jio.com',
+  'sonydaimenew.akamaized.net',
   'jiocinema.com',
 ]
 
