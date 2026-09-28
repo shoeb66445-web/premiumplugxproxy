@@ -70,6 +70,8 @@ const ALLOWED = [
   'hotstar.com',
   'slivcdn.com',
   'jio.com',
+  'jiotvpllive.cdn.jio.com',
+  'jiotvmblive.cdn.jio.com',
   'jiocinema.com',
 ]
 
@@ -77,6 +79,9 @@ const ALLOWED = [
 const NEEDS_RESIDENTIAL = [
   'slivcdn.com',
   'sonydaimenew.akamaized.net',
+  'hotstar.com',
+  'jiotvpllive.cdn.jio.com',
+  'jiotvmblive.cdn.jio.com',
   'hotstar.com',
 ]
 
