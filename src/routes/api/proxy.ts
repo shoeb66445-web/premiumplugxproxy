@@ -1,52 +1,7 @@
 /**
  * HLS + DASH CORS proxy — /api/proxy?u=<encoded url>[&cookie=][&ref=][&ua=][&via=host:port]
- *
- * Runs on Cloudflare Workers (TanStack Start / Nitro target).
- * Cloudflare Workers fetch() cannot CONNECT to SOCKS5, so residential proxies
- * are reached via an HTTP CONNECT-capable relay endpoint, not a ProxyAgent.
- * The pool from databay-labs/free-proxy-list is tried through a relay shim.
- *
- * Fetch strategy by CDN surface:
- *
- *   Hotstar (live09p, adfree, livetv, jcevents)
- *     1. HOTSTAR_RELAY env var (single known residential IP — fast, stable).
- *     2. Public Indian proxy pool via relay shim — races in batches of 8.
- *     3. Direct fetch — will 403 from CF datacenter but better than silence.
- *
- *   slivcdn / sonydaimenew.akamaized.net
- *     1. Public Indian proxy pool — batches of 12 (larger dead-entry tail).
- *     2. Direct fetch fallback.
- *
- *   FanCode, jio.com, jiocinema.com
- *     Direct from Cloudflare edge — geo check passes, no proxy needed.
- *
- * via= advisory (pinned proxy written into rewritten playlist URLs):
- *   Tried first. Evicted on latency > PROXY_EVICT_MS or on hard failure.
- *   New winner rides back in X-Proxy-Via header so the next manifest
- *   refresh picks it up automatically.
- *
- * Pool source:
- *   https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt
- *   Refreshed every 15 minutes. Cached in module scope between requests.
- *   Format: one "ip:port" per line. Lines not matching the pattern are dropped.
- *
- * RESIDENTIAL_RELAY_URL (env var):
- *   An HTTP endpoint that accepts:
- *     GET <relay>?url=<encoded>&cookie=<encoded>&ref=<encoded>&ua=<encoded>
- *   and fetches the target URL from a Mumbai residential / campus IP, returning
- *   the upstream response verbatim. Compatible with:
- *     - A second CF Worker on Bright Data / IPRoyal residential egress (IN-MH).
- *     - A Bun/Node server on a Mumbai VPS (DO BLR1, AWS ap-south-1, Hetzner BLR).
- *   If unset, pool entries are reached by constructing the same relay URL pattern
- *   against each pool IP directly (treated as open HTTP proxies).
- *
- * HOTSTAR_RELAY (env var):
- *   A single "host:port" or full HTTP URL for a known residential relay.
- *   Tried before the pool for every Hotstar host. Leave unset to skip.
  */
 import { createFileRoute } from '@tanstack/react-router'
-
-// ─── Identity constants ────────────────────────────────────────────────────────
 
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -56,10 +11,15 @@ const SONY_UA = DEFAULT_UA
 const HOTSTAR_MOBILE_UA =
   'Hotstar;in.startv.hotstar/25.02.24.8.11169@Premium Plugx(Android/15)'
 
-const SONY_ORIGIN   = 'https://www.sonyliv.com'
-const SONY_REFERER  = 'https://www.sonyliv.com/'
+const JIO_UA =
+  'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
+
+const SONY_ORIGIN     = 'https://www.sonyliv.com'
+const SONY_REFERER    = 'https://www.sonyliv.com/'
 const HOTSTAR_ORIGIN  = 'https://www.hotstar.com'
 const HOTSTAR_REFERER = 'https://www.hotstar.com/'
+const JIO_ORIGIN      = 'https://www.jio.com'
+const JIO_REFERER     = 'https://www.jio.com/'
 
 // ─── Allowlist ─────────────────────────────────────────────────────────────────
 
@@ -75,17 +35,14 @@ const ALLOWED = [
   'jiocinema.com',
 ]
 
-/* These hosts reject CF datacenter ASNs — need residential egress. */
 const NEEDS_RESIDENTIAL = [
   'slivcdn.com',
   'sonydaimenew.akamaized.net',
   'hotstar.com',
   'jiotvpllive.cdn.jio.com',
   'jiotvmblive.cdn.jio.com',
-  'hotstar.com',
 ]
 
-/* jcevents returns 403 to a desktop UA regardless of token validity. */
 const HOTSTAR_MOBILE_UA_HOSTS = [
   'jcevents.hotstar.com',
   'livetv.hotstar.com',
@@ -93,21 +50,25 @@ const HOTSTAR_MOBILE_UA_HOSTS = [
   'adfree.hotstar.com',
 ]
 
-/* DASH (.mpd) surfaces — need rewriteMpd(), not rewritePlaylist(). */
 const DASH_HOSTS = [
   'live09p.hotstar.com',
   'adfree.hotstar.com',
+  'jiotvmblive.cdn.jio.com',
+  'jiotvpllive.cdn.jio.com',
 ]
 
 const SONY_HOSTS = ['slivcdn.com', 'sonydaimenew.akamaized.net']
+const JIO_HOSTS  = ['jiotvmblive.cdn.jio.com', 'jiotvpllive.cdn.jio.com', 'jiocinema.com', 'jio.com']
 
-const allowed            = (h: string) => ALLOWED.some(s => h === s || h.endsWith('.' + s))
-const needsResidential   = (h: string) => NEEDS_RESIDENTIAL.some(s => h === s || h.endsWith('.' + s))
-const needsMobileUA      = (h: string) => HOTSTAR_MOBILE_UA_HOSTS.some(s => h === s || h.endsWith('.' + s))
-const isDashHost         = (h: string) => DASH_HOSTS.some(s => h === s || h.endsWith('.' + s))
-const isSonyHost         = (h: string) => SONY_HOSTS.some(s => h === s || h.endsWith('.' + s))
-const isHotstarHost      = (h: string) => h === 'hotstar.com' || h.endsWith('.hotstar.com')
-const isSlivCDN          = (h: string) => h === 'slivcdn.com' || h.endsWith('.slivcdn.com')
+const allowed          = (h: string) => ALLOWED.some(s => h === s || h.endsWith('.' + s))
+const needsResidential = (h: string) => NEEDS_RESIDENTIAL.some(s => h === s || h.endsWith('.' + s))
+const needsMobileUA    = (h: string) => HOTSTAR_MOBILE_UA_HOSTS.some(s => h === s || h.endsWith('.' + s))
+const isDashHost       = (h: string) => DASH_HOSTS.some(s => h === s || h.endsWith('.' + s))
+const isSonyHost       = (h: string) => SONY_HOSTS.some(s => h === s || h.endsWith('.' + s))
+const isHotstarHost    = (h: string) => h === 'hotstar.com' || h.endsWith('.hotstar.com')
+const isSlivCDN        = (h: string) => h === 'slivcdn.com' || h.endsWith('.slivcdn.com')
+const isJioHost        = (h: string) => JIO_HOSTS.some(s => h === s || h.endsWith('.' + s))
+const isJioMobileCDN   = (h: string) => h === 'jiotvmblive.cdn.jio.com' || h === 'jiotvpllive.cdn.jio.com'
 
 // ─── CORS ──────────────────────────────────────────────────────────────────────
 
@@ -124,14 +85,7 @@ function corsHeaders(): Record<string, string> {
 const PROXY_LIST_URL =
   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt'
 
-/* Module-scope pool cache — survives across requests within one Worker isolate. */
 let poolCache: { list: string[]; at: number } = { list: [], at: 0 }
-
-/*
- * known: hostname → { proxy, ms, at }
- * Stores the last proxy that returned 200 and how long it took.
- * Entries with ms > PROXY_EVICT_MS are treated as stale and re-raced.
- */
 const knownProxies = new Map<string, { proxy: string; ms: number; at: number }>()
 const PROXY_EVICT_MS = 3000
 
@@ -151,15 +105,6 @@ async function getProxyList(): Promise<string[]> {
   return poolCache.list
 }
 
-/*
- * Workers fetch() cannot use ProxyAgent (undici) or CONNECT tunnels.
- * Instead each pool entry is treated as an HTTP relay that accepts:
- *   GET http://<proxyIp:port>/?url=<encoded>&cookie=&ref=&ua=
- *
- * If RESIDENTIAL_RELAY_URL is set, pool entries are forwarded to it with
- * an X-Proxy-IP header so the relay can open the CONNECT tunnel itself.
- * This is the correct Workers-compatible pattern.
- */
 async function fetchViaPoolEntry(
   proxyHostPort: string,
   targetUrl: URL,
@@ -170,27 +115,19 @@ async function fetchViaPoolEntry(
   relayUrl: string,
   timeoutMs: number,
 ): Promise<Response> {
-  /*
-   * Two modes:
-   *   1. RESIDENTIAL_RELAY_URL set: send to the relay with X-Proxy-IP so it
-   *      CONNECT-tunnels through the pool entry.
-   *   2. No relay: treat the pool entry as a plain HTTP proxy that accepts
-   *      a target URL in the query string (open-proxy compatible format).
-   */
   let fetchUrl: string
   const fetchHeaders = new Headers(upstreamHeaders)
 
   if (relayUrl) {
     const u = new URL(relayUrl)
-    u.searchParams.set('url',    targetUrl.toString())
-    u.searchParams.set('proxy',  proxyHostPort)
+    u.searchParams.set('url',   targetUrl.toString())
+    u.searchParams.set('proxy', proxyHostPort)
     if (cookie) u.searchParams.set('cookie', cookie)
     if (ref)    u.searchParams.set('ref',    ref)
     if (ua)     u.searchParams.set('ua',     ua)
     fetchUrl = u.toString()
     fetchHeaders.set('X-Proxy-IP', proxyHostPort)
   } else {
-    /* Open-proxy format: http://proxyip:port/?url=encoded */
     const u = new URL(`http://${proxyHostPort}/`)
     u.searchParams.set('url', targetUrl.toString())
     if (cookie) u.searchParams.set('cookie', cookie)
@@ -206,10 +143,6 @@ async function fetchViaPoolEntry(
   })
 }
 
-/*
- * Timed fetch via a single pool entry.
- * Returns { res, ms } so callers can evict slow proxies.
- */
 async function timedPoolFetch(
   proxy: string,
   targetUrl: URL,
@@ -225,14 +158,6 @@ async function timedPoolFetch(
   return { res, ms: Date.now() - t0 }
 }
 
-/*
- * Race the pool in batches. Returns the first proxy + response that answered
- * 200, or null. Batch size: 12 for slivcdn (larger dead-entry tail), 8 elsewhere.
- *
- * The remembered proxy for this hostname is tried first unless its last
- * recorded latency exceeded PROXY_EVICT_MS — in that case it's moved to the
- * end and a fresh proxy leads.
- */
 async function findProxy(
   targetUrl: URL,
   upstreamHeaders: Headers,
@@ -246,20 +171,26 @@ async function findProxy(
   if (!list.length) return null
 
   const hostname = targetUrl.hostname
-  const BATCH    = isSlivCDN(hostname) ? 12 : 8
+  /* Wider batch for slivcdn and Jio mobile CDN — both have high dead-entry rates. */
+  const BATCH = (isSlivCDN(hostname) || isJioMobileCDN(hostname)) ? 14 : 8
 
-  const entry   = knownProxies.get(hostname)
-  const stale   = entry && entry.ms > PROXY_EVICT_MS
-  const pinned  = entry && !stale && entry.proxy !== skip ? entry.proxy : null
-  const rest    = list.filter(p => p !== pinned && p !== skip)
+  const entry  = knownProxies.get(hostname)
+  const stale  = entry && entry.ms > PROXY_EVICT_MS
+  const pinned = entry && !stale && entry.proxy !== skip ? entry.proxy : null
+  const rest   = list.filter(p => p !== pinned && p !== skip)
   const ordered = pinned ? [pinned, ...rest] : rest
 
-  for (let i = 0; i < Math.min(ordered.length, 48); i += BATCH) {
+  for (let i = 0; i < Math.min(ordered.length, 56); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH)
 
     const hit = await Promise.any(
       batch.map(async (p) => {
         const { res, ms } = await timedPoolFetch(p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 7000)
+        /*
+         * Jio CDN returns 450 for geo-blocked ASNs and 403 for missing auth.
+         * Treat both as proxy failure so we keep racing until an Indian
+         * residential exit node returns 200.
+         */
         if (!res.ok) throw new Error(String(res.status))
         return { proxy: p, res, ms }
       }),
@@ -282,8 +213,29 @@ function hotstarHeaders(cookie: string, ua: string, ref: string): Headers {
 
   const h = new Headers({
     'Accept':          '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8',
     'User-Agent':      ua || HOTSTAR_MOBILE_UA,
+    'Referer':         referer,
+    'Origin':          origin,
+    'Sec-Fetch-Dest':  'empty',
+    'Sec-Fetch-Mode':  'cors',
+    'Sec-Fetch-Site':  'cross-site',
+    'Cache-Control':   'no-cache',
+    'Pragma':          'no-cache',
+  })
+  if (cookie) h.set('Cookie', cookie)
+  return h
+}
+
+function jioHeaders(cookie: string, ua: string, ref: string): Headers {
+  const referer = ref || JIO_REFERER
+  let origin: string
+  try { origin = new URL(referer).origin } catch { origin = JIO_ORIGIN }
+
+  const h = new Headers({
+    'Accept':          '*/*',
+    'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8',
+    'User-Agent':      ua || JIO_UA,
     'Referer':         referer,
     'Origin':          origin,
     'Sec-Fetch-Dest':  'empty',
@@ -311,20 +263,6 @@ function genericHeaders(ua: string, ref: string, origin: string, cookie: string)
 
 // ─── DASH rewriter ─────────────────────────────────────────────────────────────
 
-/*
- * v2 DASH rewriter — handles all three BaseURL levels per DASH spec.
- *
- * Priority order in DASH: AdaptationSet-level > Period-level > MPD-level.
- * Old v1 approach (inject one MPD-level BaseURL when absent) silently breaks
- * when the manifest carries Period-level or AdaptationSet-level declarations
- * that override the injected one.
- *
- * v2 approach:
- *   1. Resolve every existing <BaseURL> at all levels to absolute and proxy it.
- *   2. Rewrite SegmentTemplate media= and initialization= absolute URLs.
- *   3. If no <BaseURL> existed at any level, inject one at MPD level pointing
- *      at the manifest's directory (v1 fallback, still correct for simple MPDs).
- */
 function rewriteMpd(text: string, baseUrl: URL, proxyBase: string, extras: string): string {
   const wrap  = (abs: string) => proxyBase + '?u=' + encodeURIComponent(abs) + extras
   const toAbs = (ref: string) => {
@@ -332,25 +270,21 @@ function rewriteMpd(text: string, baseUrl: URL, proxyBase: string, extras: strin
   }
   const dir = baseUrl.href.slice(0, baseUrl.href.lastIndexOf('/') + 1)
 
-  /* Step 1: resolve + proxy all existing <BaseURL> elements. */
   let found = false
   let out = text.replace(/<BaseURL>([^<]+)<\/BaseURL>/gi, (_, u) => {
     found = true
     return `<BaseURL>${wrap(toAbs(u))}</BaseURL>`
   })
 
-  /* Step 2: SegmentTemplate absolute URL attributes — double-quoted. */
   out = out.replace(
     /\b(media|initialization)="(https?:\/\/[^"]+)"/gi,
     (_, attr, u) => `${attr}="${wrap(u)}"`,
   )
-  /* Single-quoted variants. */
   out = out.replace(
     /\b(media|initialization)='(https?:\/\/[^']+)'/gi,
     (_, attr, u) => `${attr}='${wrap(u)}'`,
   )
 
-  /* Step 3: no BaseURL at any level — inject at MPD root (simple manifest fallback). */
   if (!found) {
     out = out.replace(/(<MPD\b[^>]*>)/i, `$1<BaseURL>${wrap(dir)}</BaseURL>`)
   }
@@ -363,8 +297,6 @@ function rewriteMpd(text: string, baseUrl: URL, proxyBase: string, extras: strin
 function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: string): string {
   const wrap = (abs: string) => proxyBase + '?u=' + encodeURIComponent(abs) + extras
 
-  /* SonyLiv / slivcdn sign at folder level — child URLs without a query string
-     inherit the parent's token via this parentQuery injection. */
   const parentQuery = baseUrl.search
   const toAbs = (ref: string) => {
     const u = new URL(ref, baseUrl)
@@ -385,12 +317,6 @@ function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: 
 
 // ─── Segment prefetch ──────────────────────────────────────────────────────────
 
-/*
- * Fire HEAD requests to the first 2 segments after rewriting any manifest.
- * Keeps Hotstar CDN warm — kills the ~800ms cold-start stall that depletes
- * hls.js / dash.js buffer below the panic threshold.
- * ctx.waitUntil() runs these after the manifest is already sent to the player.
- */
 function prefetchSegments(
   rewrittenText: string,
   cookie: string,
@@ -404,7 +330,7 @@ function prefetchSegments(
   let m: RegExpExecArray | null
   while ((m = re.exec(rewrittenText)) !== null && found.length < 2) found.push(m[0])
   if (!found.length) return
-  const h = hotstarHeaders(cookie, ua, ref)
+  const h = jioHeaders(cookie, ua, ref)
   ctx.waitUntil(
     Promise.allSettled(found.map(url => fetch(url, { method: 'HEAD', headers: h }).catch(() => {}))),
   )
@@ -417,7 +343,13 @@ function isHls(path: string, ct: string): boolean {
 }
 
 function isDash(path: string, ct: string): boolean {
-  return path.endsWith('.mpd') || ct.includes('dash+xml') || ct.includes('application/xml')
+  return (
+    path.endsWith('.mpd') ||
+    ct.includes('dash+xml') ||
+    ct.includes('application/xml') ||
+    /* Jio CDN sometimes returns octet-stream for .mpd */
+    (path.endsWith('.mpd') && ct.includes('octet-stream'))
+  )
 }
 
 // ─── Core proxy handler ────────────────────────────────────────────────────────
@@ -448,11 +380,13 @@ async function handleProxy(
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
 
-  // ── Assemble upstream headers ──────────────────────────────────────────────
+  // ── Upstream headers ───────────────────────────────────────────────────────
 
   let upstreamHeaders: Headers
 
-  if (isHotstarHost(host)) {
+  if (isJioHost(host)) {
+    upstreamHeaders = jioHeaders(cookie, ua, ref)
+  } else if (isHotstarHost(host)) {
     const effectiveUA = needsMobileUA(host) ? (ua || HOTSTAR_MOBILE_UA) : (ua || DEFAULT_UA)
     upstreamHeaders = hotstarHeaders(cookie, effectiveUA, ref)
   } else if (isSonyHost(host)) {
@@ -475,11 +409,6 @@ async function handleProxy(
 
   try {
     if (via) {
-      /*
-       * via= advisory path — the pinned proxy was written into the playlist URLs
-       * by the previous manifest fetch. Try it first. Evict on latency or failure.
-       * Re-race the pool if it's dead. New winner rides back in X-Proxy-Via.
-       */
       const entry  = knownProxies.get(host)
       const stale  = entry && entry.ms > PROXY_EVICT_MS
       const pinned = (entry && !stale) ? entry.proxy : via
@@ -500,15 +429,25 @@ async function handleProxy(
       if (!hit) hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, pinned)
 
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-      else     upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+
+    } else if (isJioMobileCDN(host)) {
+      /*
+       * jiotvmblive / jiotvpllive — Jio's Akamai edge hard-blocks CF ASNs.
+       * 450 = geo-reject from Akamai token enforcement on non-Indian ASNs.
+       * Must go through Indian residential pool. No direct fallback — a direct
+       * fetch will always 450 from a CF datacenter.
+       */
+      const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
+      if (hit) {
+        upstream  = hit.res
+        usedProxy = hit.proxy
+      } else {
+        /* Pool exhausted — last resort direct. Will likely 450 but beats silence. */
+        upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      }
 
     } else if (isHotstarHost(host)) {
-      /*
-       * Hotstar fast path:
-       *   1. HOTSTAR_RELAY — known residential IP, tried first, no pool roulette.
-       *   2. Public pool via relay shim — batches of 8, max 48 attempts.
-       *   3. Direct fetch — will likely 403 from CF datacenter but avoids silence.
-       */
       if (hotstarRelay) {
         try {
           const { res, ms } = await timedPoolFetch(hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6000)
@@ -517,7 +456,7 @@ async function handleProxy(
             usedProxy = hotstarRelay
             knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now() })
           }
-        } catch { /* fall through to pool */ }
+        } catch { /* fall through */ }
       }
 
       if (!upstream) {
@@ -526,19 +465,7 @@ async function handleProxy(
         else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
       }
 
-      /* slivcdn: retry once with canonical Sony profile on 403. */
-      if (!upstream!.ok && upstream!.status === 403 && isSlivCDN(host)) {
-        const fallback = genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie)
-        const hit = await findProxy(targetUrl, fallback, cookie, ref, ua, relayUrl)
-        if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-      }
-
     } else if (needsResidential(host)) {
-      /*
-       * slivcdn / sonydaimenew.akamaized.net — pool path.
-       * Wider batch (12) because slivcdn pool has more dead entries.
-       * 403-retry with canonical Sony profile if entire pool comes back 403.
-       */
       let hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
       else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
@@ -550,9 +477,9 @@ async function handleProxy(
       }
 
     } else {
-      /* FanCode, jio.com, jiocinema.com — straight from CF edge, geo passes. */
       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
     }
+
   } catch (e) {
     return new Response('Upstream failed: ' + (e as Error).message, {
       status: 502, headers: corsHeaders(),
@@ -575,7 +502,6 @@ async function handleProxy(
   const responseHeaders: Record<string, string> = { ...corsHeaders() }
   if (usedProxy) responseHeaders['X-Proxy-Via'] = usedProxy
 
-  /* Non-2xx: hand the raw failure back so the player sees the real status. */
   if (!upstream.ok) {
     const body = await upstream.text()
     return new Response(body.slice(0, 2000) || `Upstream returned HTTP ${upstream.status}`, {
@@ -593,10 +519,10 @@ async function handleProxy(
 
   // ── DASH manifest ──────────────────────────────────────────────────────────
 
-  if (isDash(path, contentType)) {
+  if (isDash(path, contentType) || isDashHost(host)) {
     const text      = await upstream.text()
     const rewritten = rewriteMpd(text, targetUrl, proxyBase, extras)
-    prefetchSegments(rewritten, cookie, ua || HOTSTAR_MOBILE_UA, ref, ctx)
+    prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, ctx)
     return new Response(rewritten, {
       status: 200,
       headers: { ...responseHeaders, 'Content-Type': 'application/dash+xml', 'Cache-Control': 'no-cache' },
@@ -608,14 +534,14 @@ async function handleProxy(
   if (isHls(path, contentType)) {
     const text      = await upstream.text()
     const rewritten = rewritePlaylist(text, targetUrl, proxyBase, extras)
-    prefetchSegments(rewritten, cookie, ua || HOTSTAR_MOBILE_UA, ref, ctx)
+    prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, ctx)
     return new Response(rewritten, {
       status: 200,
       headers: { ...responseHeaders, 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' },
     })
   }
 
-  // ── Segments / keys / binary passthrough ───────────────────────────────────
+  // ── Binary passthrough ─────────────────────────────────────────────────────
 
   const respHeaders = new Headers(upstream.headers)
   for (const [k, v] of Object.entries(responseHeaders)) respHeaders.set(k, v)
