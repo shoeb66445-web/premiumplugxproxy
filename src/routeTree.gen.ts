@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as ApiProxyRouteImport } from './routes/api/proxy'
+import { Route as ApiSonyRouteImport } from './routes/api/sony'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -22,31 +23,40 @@ const ApiProxyRoute = ApiProxyRouteImport.update({
   path: '/api/proxy',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiSonyRoute = ApiSonyRouteImport.update({
+  id: '/api/sony',
+  path: '/api/sony',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/api/proxy': typeof ApiProxyRoute
+  '/api/sony': typeof ApiSonyRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/api/proxy': typeof ApiProxyRoute
+  '/api/sony': typeof ApiSonyRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/api/proxy': typeof ApiProxyRoute
+  '/api/sony': typeof ApiSonyRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/api/proxy'
+  fullPaths: '/' | '/api/proxy' | '/api/sony'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/api/proxy'
-  id: '__root__' | '/' | '/api/proxy'
+  to: '/' | '/api/proxy' | '/api/sony'
+  id: '__root__' | '/' | '/api/proxy' | '/api/sony'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   ApiProxyRoute: typeof ApiProxyRoute
+  ApiSonyRoute: typeof ApiSonyRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +75,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiProxyRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/sony': {
+      id: '/api/sony'
+      path: '/api/sony'
+      fullPath: '/api/sony'
+      preLoaderRoute: typeof ApiSonyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   ApiProxyRoute: ApiProxyRoute,
+  ApiSonyRoute: ApiSonyRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
