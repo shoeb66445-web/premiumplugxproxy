@@ -768,6 +768,8 @@ async function handleProxy(
   for (const [k, v] of Object.entries(responseHeaders)) respHeaders.set(k, v)
   respHeaders.delete('content-security-policy')
   respHeaders.delete('content-encoding')
+  // Segments are immutable — let browser + edge cache them aggressively
+  respHeaders.set('Cache-Control', 'public, max-age=120, immutable')
   return new Response(upstream.body, { status: upstream.status, headers: respHeaders })
 }
 
