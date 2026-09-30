@@ -338,8 +338,8 @@ async function findProxy(
   const pool    = await getOrderedPool(host)
   if (!pool.length) return null
 
-  /* Larger batch for high-dead-entry CDNs */
-  const BATCH = (isSlivCDN(host) || isJioMobileCDN(host)) ? 14 : 10
+  /* Runtime allows 6 concurrent outbound connections — larger batches just queue */
+  const BATCH = 6
 
   const entry   = knownProxies.get(host)
   const stale   = entry && entry.ms > PROXY_EVICT_MS
@@ -347,8 +347,8 @@ async function findProxy(
   const rest    = pool.filter(p => p !== pinned && p !== skip)
   const ordered = pinned ? [pinned, ...rest] : rest
 
-  /* Try up to 84 proxies across batches before giving up */
-  for (let i = 0; i < Math.min(ordered.length, 84); i += BATCH) {
+  /* Try up to 36 proxies across batches before giving up */
+  for (let i = 0; i < Math.min(ordered.length, 36); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH)
 
     const hit = await Promise.any(
@@ -517,6 +517,25 @@ function isDash(path: string, ct: string): boolean {
   )
 }
 
+// ─── Direct fetch with edge caching ───────────────────────────────────────────
+// Segments are immutable and shared across viewers — cache them at the edge so
+// repeat requests are served instantly without hitting the origin.
+
+function directFetch(
+  targetUrl: URL,
+  headers: Headers,
+  isManifest: boolean,
+  timeoutMs = 10000,
+): Promise<Response> {
+  const init: RequestInit & { cf?: { cacheEverything: boolean; cacheTtl: number } } = {
+    headers,
+    redirect: 'follow',
+    signal: AbortSignal.timeout(timeoutMs),
+  }
+  if (!isManifest) init.cf = { cacheEverything: true, cacheTtl: 120 }
+  return fetch(targetUrl.toString(), init as RequestInit)
+}
+
 // ─── Core proxy handler ────────────────────────────────────────────────────────
 
 async function handleProxy(
@@ -578,6 +597,22 @@ async function handleProxy(
   let upstream: Response | null = null
   let usedProxy = ''
   const needsProxy = needsResidential(host) || geoRequired(host) !== null
+  const pathLower  = targetUrl.pathname.toLowerCase()
+  const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
+
+  /** Race direct edge fetch against the proxy pool — first OK response wins. */
+  async function raceDirectAndPool(): Promise<void> {
+    const direct = directFetch(targetUrl, upstreamHeaders, isManifest)
+      .then(r => { if (!r.ok) throw new Error(String(r.status)); return { res: r, proxy: '' } })
+    const pooled = findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
+      .then(hit => {
+        if (!hit) throw new Error('no proxy')
+        knownProxies.set(host, { proxy: hit.proxy, ms: hit.ms, at: Date.now() })
+        return { res: hit.res, proxy: hit.proxy }
+      })
+    const winner = await Promise.any([direct, pooled]).catch(() => null)
+    if (winner) { upstream = winner.res; usedProxy = winner.proxy }
+  }
 
   try {
     if (via) {
@@ -603,7 +638,7 @@ async function handleProxy(
 
       if (!hit) hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, pinned)
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-      else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
 
     } else if (isJioMobileCDN(host)) {
       // Hard geo-block — pool only, direct will always 450
@@ -618,7 +653,7 @@ async function handleProxy(
       if (!upstream) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-        else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+        else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       }
 
     } else if (isHotstarHost(host)) {
@@ -633,18 +668,17 @@ async function handleProxy(
       if (!upstream) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-        else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+        else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       }
 
     } else if (needsProxy) {
-      // Generic geo-restricted host — country pool first, global fallback
-      let hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
-      if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-      else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      // Geo-restricted — race direct edge fetch against the pool; first OK wins
+      await raceDirectAndPool()
 
       // Sony multi-profile retry: CDNs fingerprint UA+Referer combos, so on
       // 403 rotate through desktop, mobile-app, and bare profiles via the pool.
-      if (!upstream!.ok && upstream!.status === 403 && isSonyHost(host)) {
+      const upstreamRes = upstream as Response | null
+      if ((!upstreamRes || !upstreamRes.ok) && isSonyHost(host)) {
         const profiles = [
           genericHeaders(SONY_MOBILE_UA, SONY_REFERER, SONY_ORIGIN, cookie),
           genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie),
@@ -652,14 +686,15 @@ async function handleProxy(
           genericHeaders(DEFAULT_UA, '', '', cookie),
         ]
         for (const profile of profiles) {
-          hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
+          const hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
           if (hit) { upstream = hit.res; usedProxy = hit.proxy; break }
         }
       }
+      if (!upstream) upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
 
     } else {
-      // No geo restriction — straight from CF edge
-      upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      // No geo restriction — straight from CF edge (segments edge-cached)
+      upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       // If direct gets a geo-block response, fall back to pool automatically
       if (!upstream.ok && (upstream.status === 403 || upstream.status === 451 || upstream.status === 450)) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
@@ -734,6 +769,8 @@ async function handleProxy(
   for (const [k, v] of Object.entries(responseHeaders)) respHeaders.set(k, v)
   respHeaders.delete('content-security-policy')
   respHeaders.delete('content-encoding')
+  // Segments are immutable — let browser + edge cache them aggressively
+  respHeaders.set('Cache-Control', 'public, max-age=120, immutable')
   return new Response(upstream.body, { status: upstream.status, headers: respHeaders })
 }
 
