@@ -597,6 +597,22 @@ async function handleProxy(
   let upstream: Response | null = null
   let usedProxy = ''
   const needsProxy = needsResidential(host) || geoRequired(host) !== null
+  const pathLower  = targetUrl.pathname.toLowerCase()
+  const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
+
+  /** Race direct edge fetch against the proxy pool — first OK response wins. */
+  async function raceDirectAndPool(): Promise<void> {
+    const direct = directFetch(targetUrl, upstreamHeaders, isManifest)
+      .then(r => { if (!r.ok) throw new Error(String(r.status)); return { res: r, proxy: '' } })
+    const pooled = findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
+      .then(hit => {
+        if (!hit) throw new Error('no proxy')
+        knownProxies.set(host, { proxy: hit.proxy, ms: hit.ms, at: Date.now() })
+        return { res: hit.res, proxy: hit.proxy }
+      })
+    const winner = await Promise.any([direct, pooled]).catch(() => null)
+    if (winner) { upstream = winner.res; usedProxy = winner.proxy }
+  }
 
   try {
     if (via) {
