@@ -677,7 +677,8 @@ async function handleProxy(
 
       // Sony multi-profile retry: CDNs fingerprint UA+Referer combos, so on
       // 403 rotate through desktop, mobile-app, and bare profiles via the pool.
-      if ((!upstream || !upstream.ok) && isSonyHost(host)) {
+      const upstreamRes = upstream as Response | null
+      if ((!upstreamRes || !upstreamRes.ok) && isSonyHost(host)) {
         const profiles = [
           genericHeaders(SONY_MOBILE_UA, SONY_REFERER, SONY_ORIGIN, cookie),
           genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie),
