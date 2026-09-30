@@ -6,6 +6,8 @@ import { createFileRoute } from '@tanstack/react-router'
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 const SONY_UA = DEFAULT_UA
+const SONY_MOBILE_UA =
+  'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 SonyLiv/6.16.4'
 const HOTSTAR_MOBILE_UA =
   'Hotstar;in.startv.hotstar/25.02.24.8.11169@Premium Plugx(Android/15)'
 const JIO_UA =
@@ -545,6 +547,9 @@ async function handleProxy(
 
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
+
+  // Forward Range so players can seek / resume partial segments
+  const rangeHeader = request.headers.get('range') || ''
 
   // ── Upstream headers ───────────────────────────────────────────────────────
 
