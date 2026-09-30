@@ -38,14 +38,14 @@ function parsePlaylist(text: string): Channel[] {
   const channels: Channel[] = []
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim()
+    const line = lines[i]?.trim() ?? ''
     if (!line.startsWith('#EXTINF')) continue
     const name = line.split(',').pop()?.trim() || 'Unknown'
     const logo = /tvg-logo="([^"]*)"/.exec(line)?.[1] ?? ''
     const group = /group-title="([^"]*)"/.exec(line)?.[1] ?? ''
     // URL may be on the next non-empty, non-# line
     for (let j = i + 1; j < lines.length; j++) {
-      const u = lines[j].trim()
+      const u = lines[j]?.trim() ?? ''
       if (!u) continue
       if (u.startsWith('#')) continue
       if (/^https?:\/\//.test(u)) channels.push({ name, logo, group, url: u })

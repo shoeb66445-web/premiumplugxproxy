@@ -236,7 +236,7 @@ async function fetchPoolText(url: string): Promise<string[]> {
 
 async function getPool(key: PoolKey): Promise<string[]> {
   const cached = poolCache.get(key)
-  const sources = POOL_SOURCES[key] ?? POOL_SOURCES.global
+  const sources = POOL_SOURCES[key] ?? POOL_SOURCES['global'] ?? []
   const ttl     = sources[0]?.ttlMs ?? 15 * 60_000
 
   if (cached && cached.list.length && Date.now() - cached.at < ttl) return cached.list
