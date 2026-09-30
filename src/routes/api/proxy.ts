@@ -638,7 +638,7 @@ async function handleProxy(
 
       if (!hit) hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, pinned)
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-      else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
 
     } else if (isJioMobileCDN(host)) {
       // Hard geo-block — pool only, direct will always 450
@@ -653,7 +653,7 @@ async function handleProxy(
       if (!upstream) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-        else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+        else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       }
 
     } else if (isHotstarHost(host)) {
@@ -668,7 +668,7 @@ async function handleProxy(
       if (!upstream) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-        else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+        else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       }
 
     } else if (needsProxy) {
