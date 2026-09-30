@@ -338,8 +338,8 @@ async function findProxy(
   const pool    = await getOrderedPool(host)
   if (!pool.length) return null
 
-  /* Larger batch for high-dead-entry CDNs */
-  const BATCH = (isSlivCDN(host) || isJioMobileCDN(host)) ? 14 : 10
+  /* Runtime allows 6 concurrent outbound connections — larger batches just queue */
+  const BATCH = 6
 
   const entry   = knownProxies.get(host)
   const stale   = entry && entry.ms > PROXY_EVICT_MS
@@ -347,8 +347,8 @@ async function findProxy(
   const rest    = pool.filter(p => p !== pinned && p !== skip)
   const ordered = pinned ? [pinned, ...rest] : rest
 
-  /* Try up to 84 proxies across batches before giving up */
-  for (let i = 0; i < Math.min(ordered.length, 84); i += BATCH) {
+  /* Try up to 36 proxies across batches before giving up */
+  for (let i = 0; i < Math.min(ordered.length, 36); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH)
 
     const hit = await Promise.any(
