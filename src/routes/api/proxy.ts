@@ -517,6 +517,25 @@ function isDash(path: string, ct: string): boolean {
   )
 }
 
+// ─── Direct fetch with edge caching ───────────────────────────────────────────
+// Segments are immutable and shared across viewers — cache them at the edge so
+// repeat requests are served instantly without hitting the origin.
+
+function directFetch(
+  targetUrl: URL,
+  headers: Headers,
+  isManifest: boolean,
+  timeoutMs = 10000,
+): Promise<Response> {
+  const init: RequestInit & { cf?: { cacheEverything: boolean; cacheTtl: number } } = {
+    headers,
+    redirect: 'follow',
+    signal: AbortSignal.timeout(timeoutMs),
+  }
+  if (!isManifest) init.cf = { cacheEverything: true, cacheTtl: 120 }
+  return fetch(targetUrl.toString(), init as RequestInit)
+}
+
 // ─── Core proxy handler ────────────────────────────────────────────────────────
 
 async function handleProxy(
