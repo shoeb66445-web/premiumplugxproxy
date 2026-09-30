@@ -6,6 +6,8 @@ import { createFileRoute } from '@tanstack/react-router'
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 const SONY_UA = DEFAULT_UA
+const SONY_MOBILE_UA =
+  'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 SonyLiv/6.16.4'
 const HOTSTAR_MOBILE_UA =
   'Hotstar;in.startv.hotstar/25.02.24.8.11169@Premium Plugx(Android/15)'
 const JIO_UA =
@@ -234,7 +236,7 @@ async function fetchPoolText(url: string): Promise<string[]> {
 
 async function getPool(key: PoolKey): Promise<string[]> {
   const cached = poolCache.get(key)
-  const sources = POOL_SOURCES[key] ?? POOL_SOURCES.global
+  const sources = POOL_SOURCES[key] ?? POOL_SOURCES['global'] ?? []
   const ttl     = sources[0]?.ttlMs ?? 15 * 60_000
 
   if (cached && cached.list.length && Date.now() - cached.at < ttl) return cached.list
@@ -546,6 +548,9 @@ async function handleProxy(
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
 
+  // Forward Range so players can seek / resume partial segments
+  const rangeHeader = request.headers.get('range') || ''
+
   // ── Upstream headers ───────────────────────────────────────────────────────
 
   let upstreamHeaders: Headers
@@ -566,6 +571,7 @@ async function handleProxy(
       cookie,
     )
   }
+  if (rangeHeader) upstreamHeaders.set('Range', rangeHeader)
 
   // ── Fetch strategy ─────────────────────────────────────────────────────────
 
@@ -636,10 +642,19 @@ async function handleProxy(
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
       else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
 
+      // Sony multi-profile retry: CDNs fingerprint UA+Referer combos, so on
+      // 403 rotate through desktop, mobile-app, and bare profiles via the pool.
       if (!upstream!.ok && upstream!.status === 403 && isSonyHost(host)) {
-        const fallback = genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie)
-        hit = await findProxy(targetUrl, fallback, cookie, ref, ua, relayUrl)
-        if (hit) { upstream = hit.res; usedProxy = hit.proxy }
+        const profiles = [
+          genericHeaders(SONY_MOBILE_UA, SONY_REFERER, SONY_ORIGIN, cookie),
+          genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie),
+          genericHeaders(SONY_MOBILE_UA, '', '', cookie),
+          genericHeaders(DEFAULT_UA, '', '', cookie),
+        ]
+        for (const profile of profiles) {
+          hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
+          if (hit) { upstream = hit.res; usedProxy = hit.proxy; break }
+        }
       }
 
     } else {
