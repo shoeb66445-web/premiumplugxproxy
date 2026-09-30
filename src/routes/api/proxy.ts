@@ -672,14 +672,12 @@ async function handleProxy(
       }
 
     } else if (needsProxy) {
-      // Generic geo-restricted host — country pool first, global fallback
-      let hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
-      if (hit) { upstream = hit.res; usedProxy = hit.proxy }
-      else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      // Geo-restricted — race direct edge fetch against the pool; first OK wins
+      await raceDirectAndPool()
 
       // Sony multi-profile retry: CDNs fingerprint UA+Referer combos, so on
       // 403 rotate through desktop, mobile-app, and bare profiles via the pool.
-      if (!upstream!.ok && upstream!.status === 403 && isSonyHost(host)) {
+      if ((!upstream || !upstream.ok) && isSonyHost(host)) {
         const profiles = [
           genericHeaders(SONY_MOBILE_UA, SONY_REFERER, SONY_ORIGIN, cookie),
           genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie),
@@ -687,14 +685,15 @@ async function handleProxy(
           genericHeaders(DEFAULT_UA, '', '', cookie),
         ]
         for (const profile of profiles) {
-          hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
+          const hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
           if (hit) { upstream = hit.res; usedProxy = hit.proxy; break }
         }
       }
+      if (!upstream) upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
 
     } else {
-      // No geo restriction — straight from CF edge
-      upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
+      // No geo restriction — straight from CF edge (segments edge-cached)
+      upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       // If direct gets a geo-block response, fall back to pool automatically
       if (!upstream.ok && (upstream.status === 403 || upstream.status === 451 || upstream.status === 450)) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
