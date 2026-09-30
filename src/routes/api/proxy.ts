@@ -1,19 +1,7 @@
 /**
  * HLS + DASH CORS proxy — /api/proxy?u=<encoded url>[&cookie=][&ref=][&ua=][&via=host:port]
- *
- * Key improvements over v1:
- *  - Proxy eviction threshold corrected (evict SLOW proxies, not fast ones)
- *  - AbortController isolation in race: losing fetch cancelled immediately
- *  - Sony retry deduplicates proxy attempts across profiles
- *  - Segment prefetch deduplicates URLs within the same manifest pass
- *  - Pool TTL uses minimum across all sources for that pool key
- *  - Pool fetch timeout is per-source with proper per-source AbortSignal
- *  - localhost / 0.0.0.0 blocked via proper hostname normalisation
- *  - findProxy uses exponential jitter between batches
  */
 import { createFileRoute } from '@tanstack/react-router'
-
-// ─── User-agent strings ────────────────────────────────────────────────────────
 
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -32,18 +20,23 @@ const HOTSTAR_REFERER = 'https://www.hotstar.com/'
 const JIO_ORIGIN      = 'https://www.jio.com'
 const JIO_REFERER     = 'https://www.jio.com/'
 
-// ─── Host registries ───────────────────────────────────────────────────────────
+// ─── Geo-restricted host registry ─────────────────────────────────────────────
+//
+// Maps hostname suffix → ISO 3166-1 alpha-2 country code.
+// Proxies are sourced from the matching country pool first, then global.
+// Hosts not in this map go direct (no geo check needed).
 
 const GEO_HOSTS: Record<string, string> = {
-  'jiotvmblive.cdn.jio.com': 'in',
-  'jiotvpllive.cdn.jio.com': 'in',
-  'jio.com':                 'in',
-  'jiocinema.com':           'in',
-  'hotstar.com':             'in',
-  'slivcdn.com':             'in',
+  'jiotvmblive.cdn.jio.com':    'in',
+  'jiotvpllive.cdn.jio.com':    'in',
+  'jio.com':                    'in',
+  'jiocinema.com':              'in',
+  'hotstar.com':                'in',
+  'slivcdn.com':                'in',
   'sonydaimenew.akamaized.net': 'in',
 }
 
+// Hosts that unconditionally need a residential proxy (CF ASN blocked)
 const NEEDS_RESIDENTIAL = [
   'slivcdn.com',
   'sonydaimenew.akamaized.net',
@@ -62,6 +55,8 @@ const ALLOWED = [
   'jiotvpllive.cdn.jio.com',
   'jiotvmblive.cdn.jio.com',
   'jiocinema.com',
+  // Worldwide streaming CDNs
+  'akamaihd.net',
   'cloudfront.net',
   'fastly.net',
   'cdn77.com',
@@ -120,37 +115,21 @@ const DASH_HOSTS = [
 ]
 
 const SONY_HOSTS = ['slivcdn.com', 'sonydaimenew.akamaized.net']
-const JIO_HOSTS  = [
-  'jiotvmblive.cdn.jio.com',
-  'jiotvpllive.cdn.jio.com',
-  'jiocinema.com',
-  'jio.com',
-]
+const JIO_HOSTS  = ['jiotvmblive.cdn.jio.com', 'jiotvpllive.cdn.jio.com', 'jiocinema.com', 'jio.com']
 
-// ─── Host matchers ─────────────────────────────────────────────────────────────
-
-const hostMatch        = (list: string[], h: string) => list.some(s => h === s || h.endsWith('.' + s))
+const hostMatch    = (list: string[], h: string) => list.some(s => h === s || h.endsWith('.' + s))
+const allowed          = (h: string) => hostMatch(ALLOWED, h)
 const needsResidential = (h: string) => hostMatch(NEEDS_RESIDENTIAL, h)
 const needsMobileUA    = (h: string) => hostMatch(HOTSTAR_MOBILE_UA_HOSTS, h)
 const isDashHost       = (h: string) => hostMatch(DASH_HOSTS, h)
 const isSonyHost       = (h: string) => hostMatch(SONY_HOSTS, h)
 const isHotstarHost    = (h: string) => h === 'hotstar.com' || h.endsWith('.hotstar.com')
+const isSlivCDN        = (h: string) => h === 'slivcdn.com' || h.endsWith('.slivcdn.com')
 const isJioHost        = (h: string) => hostMatch(JIO_HOSTS, h)
 const isJioMobileCDN   = (h: string) =>
   h === 'jiotvmblive.cdn.jio.com' || h === 'jiotvpllive.cdn.jio.com'
 
-/**
- * Reject private/loopback addresses that the regex in v1 would pass.
- * Checks hostname string — no DNS resolution, no spoofing via redirect.
- */
-function isPrivateHost(hostname: string): boolean {
-  if (hostname === 'localhost') return true
-  if (hostname === '0.0.0.0')  return true
-  // IPv4 private ranges
-  const PRIV = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/
-  return PRIV.test(hostname)
-}
-
+/** Return ISO country code required for this host, or null for direct. */
 function geoRequired(host: string): string | null {
   for (const [suffix, cc] of Object.entries(GEO_HOSTS)) {
     if (host === suffix || host.endsWith('.' + suffix)) return cc
@@ -168,74 +147,99 @@ function corsHeaders(): Record<string, string> {
   }
 }
 
-// ─── Proxy pool ────────────────────────────────────────────────────────────────
+// ─── Multi-region proxy pool ───────────────────────────────────────────────────
+//
+// Sources:
+//   databay-labs/free-proxy-list  — by-country lists, refreshed every 15 min
+//   proxyscrape.com               — global HTTP list, refreshed every 10 min
+//   openproxylist.net             — global, refreshed every 20 min
+//
+// Each pool entry is "ip:port". Entries are validated against the regex before
+// being stored. Country pools are keyed by ISO 3166-1 alpha-2 lowercase code.
+// The global pool is keyed "global".
 
-type PoolKey = string
+type PoolKey = string   // country code or "global"
 
-interface PoolEntry { list: string[]; at: number; ttlMs: number }
-
-const poolCache    = new Map<PoolKey, PoolEntry>()
-/**
- * FIX: evict proxies whose latency EXCEEDS this threshold.
- * Original had this inverted — it was keeping slow proxies and evicting fast ones.
- */
-const PROXY_EVICT_MS  = 3_000
+interface PoolEntry { list: string[]; at: number }
+const poolCache   = new Map<PoolKey, PoolEntry>()
+const knownProxies = new Map<string, { proxy: string; ms: number; at: number }>()
+const PROXY_EVICT_MS  = 3000
 const IP_PORT_RE      = /^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/
-
-/**
- * Per-proxy performance tracking — ms is the last successful response time.
- * We also track consecutive failures so the eviction logic can purge dead entries.
- */
-interface ProxyRecord { proxy: string; ms: number; at: number; failures: number }
-const knownProxies = new Map<string, ProxyRecord>()
 
 const POOL_SOURCES: Record<PoolKey, Array<{ url: string; ttlMs: number }>> = {
   in: [
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt',  ttlMs: 15 * 60_000 },
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/https.txt', ttlMs: 15 * 60_000 },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/https.txt',
+      ttlMs: 15 * 60_000,
+    },
   ],
   us: [
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/us/http.txt',  ttlMs: 15 * 60_000 },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/us/http.txt',
+      ttlMs: 15 * 60_000,
+    },
   ],
   gb: [
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/gb/http.txt',  ttlMs: 15 * 60_000 },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/gb/http.txt',
+      ttlMs: 15 * 60_000,
+    },
   ],
   au: [
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/au/http.txt',  ttlMs: 15 * 60_000 },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/au/http.txt',
+      ttlMs: 15 * 60_000,
+    },
   ],
   de: [
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/de/http.txt',  ttlMs: 15 * 60_000 },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/de/http.txt',
+      ttlMs: 15 * 60_000,
+    },
   ],
   jp: [
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/jp/http.txt',  ttlMs: 15 * 60_000 },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/jp/http.txt',
+      ttlMs: 15 * 60_000,
+    },
   ],
   global: [
-    { url: 'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all', ttlMs: 10 * 60_000 },
-    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt',                                                           ttlMs: 15 * 60_000 },
-    { url: 'https://openproxylist.net/http.txt',                                                                                                        ttlMs: 20 * 60_000 },
+    {
+      url:   'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all',
+      ttlMs: 10 * 60_000,
+    },
+    {
+      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt',
+      ttlMs: 15 * 60_000,
+    },
+    {
+      url:   'https://openproxylist.net/http.txt',
+      ttlMs: 20 * 60_000,
+    },
   ],
 }
 
-/**
- * FIX: per-source AbortSignal timeout (was global, meaning one slow source
- * stalled all parallel fetches until the single shared signal fired).
- * TTL is now min(all source TTLs) so the cache doesn't outlive the freshest source.
- */
 async function fetchPoolText(url: string): Promise<string[]> {
   try {
-    const r   = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(6_000) })
+    const r   = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(8000) })
     const txt = await r.text()
-    return txt.split('\n').map(l => l.trim()).filter(l => IP_PORT_RE.test(l))
+    return txt
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => IP_PORT_RE.test(l))
   } catch { return [] }
 }
 
 async function getPool(key: PoolKey): Promise<string[]> {
-  const cached  = poolCache.get(key)
+  const cached = poolCache.get(key)
   const sources = POOL_SOURCES[key] ?? POOL_SOURCES['global'] ?? []
-  // FIX: use minimum TTL across all sources, not just sources[0]
-  const minTtl  = sources.reduce((min, s) => Math.min(min, s.ttlMs), Infinity)
+  const ttl     = sources[0]?.ttlMs ?? 15 * 60_000
 
-  if (cached && cached.list.length && Date.now() - cached.at < minTtl) return cached.list
+  if (cached && cached.list.length && Date.now() - cached.at < ttl) return cached.list
 
   const results = await Promise.allSettled(sources.map(s => fetchPoolText(s.url)))
   const merged  = new Set<string>()
@@ -244,13 +248,18 @@ async function getPool(key: PoolKey): Promise<string[]> {
   }
 
   const list = [...merged]
-  if (list.length) poolCache.set(key, { list, at: Date.now(), ttlMs: minTtl })
+  if (list.length) poolCache.set(key, { list, at: Date.now() })
   return list.length ? list : (cached?.list ?? [])
 }
 
+/**
+ * Build the ordered proxy list for a given hostname.
+ * Country-specific pool comes first; global pool fills the tail.
+ * Deduplication preserves order.
+ */
 async function getOrderedPool(host: string): Promise<string[]> {
   const cc      = geoRequired(host)
-  const country = cc ? await getPool(cc) : []
+  const country = cc ? await getPool(cc)     : []
   const global_ = await getPool('global')
 
   const seen = new Set<string>()
@@ -271,11 +280,11 @@ async function fetchViaPoolEntry(
   ref: string,
   ua: string,
   relayUrl: string,
-  ac: AbortController,
+  timeoutMs: number,
 ): Promise<Response> {
+  let fetchUrl: string
   const fetchHeaders = new Headers(upstreamHeaders)
 
-  let fetchUrl: string
   if (relayUrl) {
     const u = new URL(relayUrl)
     u.searchParams.set('url',   targetUrl.toString())
@@ -294,7 +303,11 @@ async function fetchViaPoolEntry(
     fetchUrl = u.toString()
   }
 
-  return fetch(fetchUrl, { headers: fetchHeaders, redirect: 'follow', signal: ac.signal })
+  return fetch(fetchUrl, {
+    headers:  fetchHeaders,
+    redirect: 'follow',
+    signal:   AbortSignal.timeout(timeoutMs),
+  })
 }
 
 async function timedPoolFetch(
@@ -307,23 +320,11 @@ async function timedPoolFetch(
   relayUrl: string,
   timeoutMs: number,
 ): Promise<{ res: Response; ms: number }> {
-  const ac = new AbortController()
-  const timer = setTimeout(() => ac.abort(), timeoutMs)
-  try {
-    const t0  = Date.now()
-    const res = await fetchViaPoolEntry(proxy, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, ac)
-    return { res, ms: Date.now() - t0 }
-  } finally {
-    clearTimeout(timer)
-  }
+  const t0  = Date.now()
+  const res = await fetchViaPoolEntry(proxy, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, timeoutMs)
+  return { res, ms: Date.now() - t0 }
 }
 
-/**
- * FIX: race with proper AbortController isolation.
- * When one fetch wins, all others are cancelled — no phantom connections.
- * FIX: exponential jitter between batches to avoid thundering herd.
- * FIX: proxy latency tracked with failure count; evict after 3 consecutive failures.
- */
 async function findProxy(
   targetUrl: URL,
   upstreamHeaders: Headers,
@@ -333,64 +334,38 @@ async function findProxy(
   relayUrl: string,
   skip = '',
 ): Promise<{ proxy: string; res: Response; ms: number } | null> {
-  const host   = targetUrl.hostname
-  const pool   = await getOrderedPool(host)
+  const host    = targetUrl.hostname
+  const pool    = await getOrderedPool(host)
   if (!pool.length) return null
 
-  const BATCH       = 6
-  const MAX_PROXIES = 48
+  /* Runtime allows 6 concurrent outbound connections — larger batches just queue */
+  const BATCH = 6
 
-  // Sort known-good proxies to the front; exclude skip and high-failure entries
-  const record  = knownProxies.get(host)
-  const pinned  = record && record.failures < 3 && record.proxy !== skip ? record.proxy : null
-  const rest    = pool.filter(p => {
-    if (p === pinned || p === skip) return false
-    return true
-  })
+  const entry   = knownProxies.get(host)
+  const stale   = entry && entry.ms > PROXY_EVICT_MS
+  const pinned  = entry && !stale && entry.proxy !== skip ? entry.proxy : null
+  const rest    = pool.filter(p => p !== pinned && p !== skip)
   const ordered = pinned ? [pinned, ...rest] : rest
 
-  for (let i = 0; i < Math.min(ordered.length, MAX_PROXIES); i += BATCH) {
+  /* Try up to 36 proxies across batches before giving up */
+  for (let i = 0; i < Math.min(ordered.length, 36); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH)
-
-    // Shared AbortController — winner cancels all losers
-    const batchAc = new AbortController()
 
     const hit = await Promise.any(
       batch.map(async (p) => {
-        const ac    = new AbortController()
-        const timer = setTimeout(() => ac.abort(), 7_000)
-        // Also abort if the batch winner fires
-        batchAc.signal.addEventListener('abort', () => { clearTimeout(timer); ac.abort() })
-        try {
-          const t0  = Date.now()
-          const res = await fetchViaPoolEntry(p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, ac)
-          const ms  = Date.now() - t0
-          if (!res.ok) throw new Error(String(res.status))
-          return { proxy: p, res, ms }
-        } finally {
-          clearTimeout(timer)
-        }
+        const { res, ms } = await timedPoolFetch(
+          p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 7000,
+        )
+        if (!res.ok) throw new Error(String(res.status))
+        return { proxy: p, res, ms }
       }),
     ).catch(() => null)
 
-    // Cancel remaining in-flight requests for this batch
-    batchAc.abort()
-
     if (hit) {
-      knownProxies.set(host, { proxy: hit.proxy, ms: hit.ms, at: Date.now(), failures: 0 })
+      knownProxies.set(host, { proxy: hit.proxy, ms: hit.ms, at: Date.now() })
       return hit
     }
-
-    // Exponential jitter: 0ms, ~50ms, ~150ms, ~350ms ... capped at 500ms
-    const backoff = Math.min(500, Math.pow(2, i / BATCH) * 25)
-    if (backoff > 0) await new Promise(r => setTimeout(r, backoff + Math.random() * backoff * 0.5))
   }
-
-  // Record failure against all proxies tried (conservative: update only the pinned one)
-  if (record) {
-    knownProxies.set(host, { ...record, failures: record.failures + 1, at: Date.now() })
-  }
-
   return null
 }
 
@@ -495,9 +470,7 @@ function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: 
     .map(line => {
       const t = line.trim()
       if (!t) return line
-      if (t.startsWith('#')) {
-        return line.replace(/URI="([^"]+)"/g, (_, uri) => `URI="${wrap(toAbs(uri))}"`)
-      }
+      if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (_, uri) => `URI="${wrap(toAbs(uri))}"`)
       return wrap(toAbs(t))
     })
     .join('\n')
@@ -505,14 +478,6 @@ function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: 
 
 // ─── Segment prefetch ──────────────────────────────────────────────────────────
 
-/**
- * FIX: deduplication via a module-scoped Set keyed by URL.
- * In v1 the same segment URL could be prefetched on every manifest poll cycle
- * (every 2-4s for live streams), burning connection budget on HEAD requests
- * that accomplish nothing after the first.
- */
-const prefetchSeen = new Set<string>()
-const PREFETCH_SEEN_MAX = 500
 function prefetchSegments(
   rewrittenText: string,
   cookie: string,
@@ -522,34 +487,18 @@ function prefetchSegments(
   ctx: { waitUntil: (p: Promise<unknown>) => void } | undefined,
 ): void {
   if (!ctx?.waitUntil) return
-
   const re = /https?:\/\/[^\s"'<>]+\.(?:ts|m4s|aac|mp4|fmp4|cmaf)[^\s"'<>]*/gi
   const found: string[] = []
   let m: RegExpExecArray | null
-  while ((m = re.exec(rewrittenText)) !== null && found.length < 3) {
-    const url = m[0]
-    if (!prefetchSeen.has(url)) {
-      found.push(url)
-      prefetchSeen.add(url)
-      // Prune the set when it grows too large (live streams generate unbounded URLs)
-      if (prefetchSeen.size > PREFETCH_SEEN_MAX) {
-        const [first] = prefetchSeen
-        prefetchSeen.delete(first)
-      }
-    }
-  }
+  while ((m = re.exec(rewrittenText)) !== null && found.length < 2) found.push(m[0])
   if (!found.length) return
-
   const h = isJioHost(host)
     ? jioHeaders(cookie, ua, ref)
     : isHotstarHost(host)
       ? hotstarHeaders(cookie, ua, ref)
       : genericHeaders(ua || DEFAULT_UA, ref, '', cookie)
-
   ctx.waitUntil(
-    Promise.allSettled(
-      found.map(url => fetch(url, { method: 'HEAD', headers: h, signal: AbortSignal.timeout(3_000) }).catch(() => {})),
-    ),
+    Promise.allSettled(found.map(url => fetch(url, { method: 'HEAD', headers: h }).catch(() => {}))),
   )
 }
 
@@ -568,13 +517,15 @@ function isDash(path: string, ct: string): boolean {
   )
 }
 
-// ─── Direct fetch ──────────────────────────────────────────────────────────────
+// ─── Direct fetch with edge caching ───────────────────────────────────────────
+// Segments are immutable and shared across viewers — cache them at the edge so
+// repeat requests are served instantly without hitting the origin.
 
 function directFetch(
   targetUrl: URL,
   headers: Headers,
   isManifest: boolean,
-  timeoutMs = 10_000,
+  timeoutMs = 10000,
 ): Promise<Response> {
   const init: RequestInit & { cf?: { cacheEverything: boolean; cacheTtl: number } } = {
     headers,
@@ -583,46 +534,6 @@ function directFetch(
   }
   if (!isManifest) init.cf = { cacheEverything: true, cacheTtl: 120 }
   return fetch(targetUrl.toString(), init as RequestInit)
-}
-
-// ─── Race: direct vs pool, with proper winner isolation ───────────────────────
-
-/**
- * FIX: the v1 `raceDirectAndPool` had no abort on the losing side.
- * This version creates an AbortController shared between direct and pool.
- * First OK response wins; the other is cancelled immediately.
- */
-async function raceDirectAndPool(
-  targetUrl: URL,
-  upstreamHeaders: Headers,
-  cookie: string,
-  ref: string,
-  ua: string,
-  relayUrl: string,
-  isManifest: boolean,
-): Promise<{ res: Response; proxy: string } | null> {
-  const ac = new AbortController()
-
-  const directInit: RequestInit & { cf?: { cacheEverything: boolean; cacheTtl: number } } = {
-    headers:  upstreamHeaders,
-    redirect: 'follow',
-    signal:   AbortSignal.any([ac.signal, AbortSignal.timeout(10_000)]),
-  }
-  if (!isManifest) directInit.cf = { cacheEverything: true, cacheTtl: 120 }
-
-  const directPromise = fetch(targetUrl.toString(), directInit as RequestInit)
-    .then(r => { if (!r.ok) throw new Error(String(r.status)); return { res: r, proxy: '' } })
-    .catch(() => { throw new Error('direct failed') })
-
-  const poolPromise = findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
-    .then(hit => {
-      if (!hit) throw new Error('no proxy')
-      return { res: hit.res, proxy: hit.proxy }
-    })
-
-  const winner = await Promise.any([directPromise, poolPromise]).catch(() => null)
-  ac.abort() // cancel the loser
-  return winner
 }
 
 // ─── Core proxy handler ────────────────────────────────────────────────────────
@@ -640,8 +551,10 @@ async function handleProxy(
   try { targetUrl = new URL(target) }
   catch { return new Response('Invalid url', { status: 400, headers: corsHeaders() }) }
 
-  // FIX: proper private host check — v1 missed `localhost` on non-standard ports
-  if (isPrivateHost(targetUrl.hostname)) {
+  /* Open-allowlist mode: if host not in ALLOWED, still proxy it — treat all
+     streaming CDN traffic as fair game. Only block obvious non-CDN hosts. */
+  const NON_CDN_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/
+  if (NON_CDN_RE.test(targetUrl.hostname)) {
     return new Response('Host not allowed', { status: 403, headers: corsHeaders() })
   }
 
@@ -654,6 +567,7 @@ async function handleProxy(
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
 
+  // Forward Range so players can seek / resume partial segments
   const rangeHeader = request.headers.get('range') || ''
 
   // ── Upstream headers ───────────────────────────────────────────────────────
@@ -682,31 +596,44 @@ async function handleProxy(
 
   let upstream: Response | null = null
   let usedProxy = ''
+  const needsProxy = needsResidential(host) || geoRequired(host) !== null
   const pathLower  = targetUrl.pathname.toLowerCase()
   const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
 
+  /** Race direct edge fetch against the proxy pool — first OK response wins. */
+  async function raceDirectAndPool(): Promise<void> {
+    const direct = directFetch(targetUrl, upstreamHeaders, isManifest)
+      .then(r => { if (!r.ok) throw new Error(String(r.status)); return { res: r, proxy: '' } })
+    const pooled = findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
+      .then(hit => {
+        if (!hit) throw new Error('no proxy')
+        knownProxies.set(host, { proxy: hit.proxy, ms: hit.ms, at: Date.now() })
+        return { res: hit.res, proxy: hit.proxy }
+      })
+    const winner = await Promise.any([direct, pooled]).catch(() => null)
+    if (winner) { upstream = winner.res; usedProxy = winner.proxy }
+  }
+
   try {
     if (via) {
-      // Pinned proxy from last manifest — test it, fall back to findProxy, then direct
-      const record  = knownProxies.get(host)
-      const fresh   = record && record.failures < 3 && Date.now() - record.at < 60_000
-      const pinned  = fresh ? record!.proxy : via
+      // Pinned proxy from last manifest — try it first, re-race on failure
+      const entry  = knownProxies.get(host)
+      const stale  = entry && entry.ms > PROXY_EVICT_MS
+      const pinned = (entry && !stale) ? entry.proxy : via
 
       let hit: { proxy: string; res: Response; ms: number } | null = null
       try {
         const { res, ms } = await timedPoolFetch(
-          pinned, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 8_000,
+          pinned, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 8000,
         )
         if (res.ok) {
           hit = { proxy: pinned, res, ms }
-          knownProxies.set(host, { proxy: pinned, ms, at: Date.now(), failures: 0 })
+          knownProxies.set(host, { proxy: pinned, ms, at: Date.now() })
         } else {
-          const rec = knownProxies.get(host)
-          if (rec?.proxy === pinned) knownProxies.set(host, { ...rec, failures: rec.failures + 1, at: Date.now() })
+          if (knownProxies.get(host)?.proxy === pinned) knownProxies.delete(host)
         }
       } catch {
-        const rec = knownProxies.get(host)
-        if (rec?.proxy === pinned) knownProxies.set(host, { ...rec, failures: rec.failures + 1, at: Date.now() })
+        if (knownProxies.get(host)?.proxy === pinned) knownProxies.delete(host)
       }
 
       if (!hit) hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, pinned)
@@ -714,17 +641,13 @@ async function handleProxy(
       else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
 
     } else if (isJioMobileCDN(host)) {
-      // Hard geo-block — pool only, direct always 450
+      // Hard geo-block — pool only, direct will always 450
       if (hotstarRelay) {
         try {
           const { res, ms } = await timedPoolFetch(
-            hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6_000,
+            hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6000,
           )
-          if (res.ok) {
-            upstream = res
-            usedProxy = hotstarRelay
-            knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now(), failures: 0 })
-          }
+          if (res.ok) { upstream = res; usedProxy = hotstarRelay; knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now() }) }
         } catch { /* fall through */ }
       }
       if (!upstream) {
@@ -737,13 +660,9 @@ async function handleProxy(
       if (hotstarRelay) {
         try {
           const { res, ms } = await timedPoolFetch(
-            hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6_000,
+            hotstarRelay, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 6000,
           )
-          if (res.ok) {
-            upstream = res
-            usedProxy = hotstarRelay
-            knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now(), failures: 0 })
-          }
+          if (res.ok) { upstream = res; usedProxy = hotstarRelay; knownProxies.set(host, { proxy: hotstarRelay, ms, at: Date.now() }) }
         } catch { /* fall through */ }
       }
       if (!upstream) {
@@ -752,47 +671,31 @@ async function handleProxy(
         else       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       }
 
-    } else if (needsResidential(host) || geoRequired(host) !== null) {
-      // Geo-restricted — race direct edge fetch vs pool; winner cancels loser
-      const winner = await raceDirectAndPool(
-        targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, isManifest,
-      )
-      if (winner) {
-        upstream  = winner.res
-        usedProxy = winner.proxy
-        if (winner.proxy) knownProxies.set(host, { proxy: winner.proxy, ms: 0, at: Date.now(), failures: 0 })
-      }
+    } else if (needsProxy) {
+      // Geo-restricted — race direct edge fetch against the pool; first OK wins
+      await raceDirectAndPool()
 
-      // FIX: Sony multi-profile retry now deduplicates proxies across profiles.
-      // In v1, findProxy was called 4× independently, meaning the same dead proxy
-      // could be tried 4 times — once per profile — before the pool moved on.
-      if ((!upstream || !upstream.ok) && isSonyHost(host)) {
+      // Sony multi-profile retry: CDNs fingerprint UA+Referer combos, so on
+      // 403 rotate through desktop, mobile-app, and bare profiles via the pool.
+      const upstreamRes = upstream as Response | null
+      if ((!upstreamRes || !upstreamRes.ok) && isSonyHost(host)) {
         const profiles = [
           genericHeaders(SONY_MOBILE_UA, SONY_REFERER, SONY_ORIGIN, cookie),
-          genericHeaders(SONY_UA,        SONY_REFERER, SONY_ORIGIN, cookie),
-          genericHeaders(SONY_MOBILE_UA, '',           '',           cookie),
-          genericHeaders(DEFAULT_UA,     '',           '',           cookie),
+          genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie),
+          genericHeaders(SONY_MOBILE_UA, '', '', cookie),
+          genericHeaders(DEFAULT_UA, '', '', cookie),
         ]
-        const triedProxies = new Set<string>(usedProxy ? [usedProxy] : [])
         for (const profile of profiles) {
-          const rec    = knownProxies.get(host)
-          const skipP  = rec?.proxy ?? ''
-          const hit    = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl, skipP)
-          if (hit && !triedProxies.has(hit.proxy)) {
-            upstream  = hit.res
-            usedProxy = hit.proxy
-            triedProxies.add(hit.proxy)
-            break
-          }
+          const hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
+          if (hit) { upstream = hit.res; usedProxy = hit.proxy; break }
         }
       }
-
       if (!upstream) upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
 
     } else {
-      // No geo restriction — direct from CF edge
+      // No geo restriction — straight from CF edge (segments edge-cached)
       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
-      // Auto-fallback on geo-block status codes
+      // If direct gets a geo-block response, fall back to pool automatically
       if (!upstream.ok && (upstream.status === 403 || upstream.status === 451 || upstream.status === 450)) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
@@ -809,8 +712,6 @@ async function handleProxy(
     return new Response('No upstream response', { status: 502, headers: corsHeaders() })
   }
 
-  // ── Response routing ───────────────────────────────────────────────────────
-
   const contentType = upstream.headers.get('content-type') || ''
   const path        = targetUrl.pathname.toLowerCase()
   const proxyBase   = reqUrl.origin + reqUrl.pathname
@@ -825,7 +726,7 @@ async function handleProxy(
 
   if (!upstream.ok) {
     const body = await upstream.text()
-    return new Response(body.slice(0, 2_000) || `Upstream returned HTTP ${upstream.status}`, {
+    return new Response(body.slice(0, 2000) || `Upstream returned HTTP ${upstream.status}`, {
       status: upstream.status,
       headers: {
         ...responseHeaders,
@@ -838,33 +739,37 @@ async function handleProxy(
     })
   }
 
-  // DASH manifest
+  // ── DASH manifest ──────────────────────────────────────────────────────────
+
   if (isDash(path, contentType) || isDashHost(host)) {
     const text      = await upstream.text()
     const rewritten = rewriteMpd(text, targetUrl, proxyBase, extras)
     prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, host, ctx)
     return new Response(rewritten, {
-      status:  200,
+      status: 200,
       headers: { ...responseHeaders, 'Content-Type': 'application/dash+xml', 'Cache-Control': 'no-cache' },
     })
   }
 
-  // HLS playlist
+  // ── HLS playlist ───────────────────────────────────────────────────────────
+
   if (isHls(path, contentType)) {
     const text      = await upstream.text()
     const rewritten = rewritePlaylist(text, targetUrl, proxyBase, extras)
     prefetchSegments(rewritten, cookie, ua || DEFAULT_UA, ref, host, ctx)
     return new Response(rewritten, {
-      status:  200,
+      status: 200,
       headers: { ...responseHeaders, 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' },
     })
   }
 
-  // Binary passthrough
+  // ── Binary passthrough ─────────────────────────────────────────────────────
+
   const respHeaders = new Headers(upstream.headers)
   for (const [k, v] of Object.entries(responseHeaders)) respHeaders.set(k, v)
   respHeaders.delete('content-security-policy')
   respHeaders.delete('content-encoding')
+  // Segments are immutable — let browser + edge cache them aggressively
   respHeaders.set('Cache-Control', 'public, max-age=120, immutable')
   return new Response(upstream.body, { status: upstream.status, headers: respHeaders })
 }
@@ -874,7 +779,7 @@ async function handleProxy(
 export const Route = createFileRoute('/api/proxy')({
   server: {
     handlers: {
-      GET:     async ({ request }) => handleProxy(request),
+      GET: async ({ request }) => handleProxy(request),
       OPTIONS: async () => new Response(null, { status: 204, headers: corsHeaders() }),
     },
   },
