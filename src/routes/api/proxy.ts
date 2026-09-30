@@ -571,6 +571,7 @@ async function handleProxy(
       cookie,
     )
   }
+  if (rangeHeader) upstreamHeaders.set('Range', rangeHeader)
 
   // ── Fetch strategy ─────────────────────────────────────────────────────────
 
@@ -641,10 +642,19 @@ async function handleProxy(
       if (hit) { upstream = hit.res; usedProxy = hit.proxy }
       else       upstream = await fetch(targetUrl.toString(), { headers: upstreamHeaders, redirect: 'follow', signal: AbortSignal.timeout(15000) })
 
+      // Sony multi-profile retry: CDNs fingerprint UA+Referer combos, so on
+      // 403 rotate through desktop, mobile-app, and bare profiles via the pool.
       if (!upstream!.ok && upstream!.status === 403 && isSonyHost(host)) {
-        const fallback = genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie)
-        hit = await findProxy(targetUrl, fallback, cookie, ref, ua, relayUrl)
-        if (hit) { upstream = hit.res; usedProxy = hit.proxy }
+        const profiles = [
+          genericHeaders(SONY_MOBILE_UA, SONY_REFERER, SONY_ORIGIN, cookie),
+          genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie),
+          genericHeaders(SONY_MOBILE_UA, '', '', cookie),
+          genericHeaders(DEFAULT_UA, '', '', cookie),
+        ]
+        for (const profile of profiles) {
+          hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
+          if (hit) { upstream = hit.res; usedProxy = hit.proxy; break }
+        }
       }
 
     } else {
