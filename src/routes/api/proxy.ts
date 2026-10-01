@@ -260,8 +260,10 @@ async function getPool(key: PoolKey): Promise<string[]> {
  */
 async function getOrderedPool(host: string): Promise<string[]> {
   const cc      = geoRequired(host)
-  const country = cc ? await getPool(cc)     : []
-  const global_ = await getPool('global')
+  const [country, global_] = await Promise.all([
+    cc ? getPool(cc) : Promise.resolve([]),
+    getPool('global'),
+  ])
 
   const seen = new Set<string>()
   const out: string[] = []
@@ -334,7 +336,7 @@ async function findProxy(
   ua: string,
   relayUrl: string,
   skip = '',
-  maxAttempts = 12,
+  maxAttempts = 6,
 ): Promise<{ proxy: string; res: Response; ms: number } | null> {
   const host    = targetUrl.hostname
   const pool    = await getOrderedPool(host)
@@ -578,6 +580,8 @@ async function handleProxy(
   const ua     = reqUrl.searchParams.get('ua')     || ''
   const via    = reqUrl.searchParams.get('via')    || ''
   const host   = targetUrl.hostname
+  const pathLower = targetUrl.pathname.toLowerCase()
+  const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
 
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
@@ -605,15 +609,13 @@ async function handleProxy(
       cookie,
     )
   }
-  if (rangeHeader) upstreamHeaders.set('Range', rangeHeader)
+  if (rangeHeader && !isManifest) upstreamHeaders.set('Range', rangeHeader)
 
   // ── Fetch strategy ─────────────────────────────────────────────────────────
 
   let upstream: Response | null = null
   let usedProxy = ''
   const needsProxy = needsResidential(host) || geoRequired(host) !== null
-  const pathLower  = targetUrl.pathname.toLowerCase()
-  const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
 
   /** Race direct edge fetch against the proxy pool — first OK response wins. */
   async function raceDirectAndPool(): Promise<void> {
@@ -756,11 +758,15 @@ async function handleProxy(
 
   if (isDash(path, contentType) || isDashHost(host)) {
     const text      = await upstream.text()
-    const rewritten = rewriteMpd(text, targetUrl, proxyBase, extras)
+    let manifestBase = targetUrl
+    if (!usedProxy && upstream.url) {
+      try { manifestBase = new URL(upstream.url) } catch { /* retain request URL */ }
+    }
+    const rewritten = rewriteMpd(text, manifestBase, proxyBase, extras)
     prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, host, ctx)
     return new Response(rewritten, {
       status: 200,
-      headers: { ...responseHeaders, 'Content-Type': 'application/dash+xml', 'Cache-Control': 'no-cache' },
+      headers: { ...responseHeaders, 'Content-Type': 'application/dash+xml; charset=utf-8', 'Cache-Control': 'no-cache' },
     })
   }
 
@@ -778,7 +784,7 @@ async function handleProxy(
     prefetchSegments(rewritten, cookie, ua || DEFAULT_UA, ref, host, ctx)
     return new Response(rewritten, {
       status: 200,
-      headers: { ...responseHeaders, 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' },
+      headers: { ...responseHeaders, 'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8', 'Cache-Control': 'no-cache' },
     })
   }
 
