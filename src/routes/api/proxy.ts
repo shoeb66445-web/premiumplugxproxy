@@ -144,6 +144,7 @@ function corsHeaders(): Record<string, string> {
     'Access-Control-Allow-Origin':  '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
     'Access-Control-Allow-Headers': '*',
+    'Access-Control-Expose-Headers': 'Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag',
   }
 }
 
@@ -225,7 +226,7 @@ const POOL_SOURCES: Record<PoolKey, Array<{ url: string; ttlMs: number }>> = {
 
 async function fetchPoolText(url: string): Promise<string[]> {
   try {
-    const r   = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(8000) })
+    const r   = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(4000) })
     const txt = await r.text()
     return txt
       .split('\n')
@@ -259,8 +260,10 @@ async function getPool(key: PoolKey): Promise<string[]> {
  */
 async function getOrderedPool(host: string): Promise<string[]> {
   const cc      = geoRequired(host)
-  const country = cc ? await getPool(cc)     : []
-  const global_ = await getPool('global')
+  const [country, global_] = await Promise.all([
+    cc ? getPool(cc) : Promise.resolve([]),
+    getPool('global'),
+  ])
 
   const seen = new Set<string>()
   const out: string[] = []
@@ -333,6 +336,7 @@ async function findProxy(
   ua: string,
   relayUrl: string,
   skip = '',
+  maxAttempts = 6,
 ): Promise<{ proxy: string; res: Response; ms: number } | null> {
   const host    = targetUrl.hostname
   const pool    = await getOrderedPool(host)
@@ -347,14 +351,15 @@ async function findProxy(
   const rest    = pool.filter(p => p !== pinned && p !== skip)
   const ordered = pinned ? [pinned, ...rest] : rest
 
-  /* Try up to 36 proxies across batches before giving up */
-  for (let i = 0; i < Math.min(ordered.length, 36); i += BATCH) {
+  /* Bound fallback time: two batches of six are enough to find a responsive proxy
+     without making a failed manifest request stall player startup for minutes. */
+  for (let i = 0; i < Math.min(ordered.length, maxAttempts); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH)
 
     const hit = await Promise.any(
       batch.map(async (p) => {
         const { res, ms } = await timedPoolFetch(
-          p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 7000,
+          p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 3500,
         )
         if (!res.ok) throw new Error(String(res.status))
         return { proxy: p, res, ms }
@@ -458,19 +463,31 @@ function rewriteMpd(text: string, baseUrl: URL, proxyBase: string, extras: strin
 // ─── HLS rewriter ──────────────────────────────────────────────────────────────
 
 function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: string): string {
-  const wrap = (abs: string) => proxyBase + '?u=' + encodeURIComponent(abs) + extras
-  const parentQuery = baseUrl.search
+  const wrap = (abs: string) => {
+    if (!/^https?:\/\//i.test(abs)) return abs
+    return proxyBase + '?u=' + encodeURIComponent(abs) + extras
+  }
   const toAbs = (ref: string) => {
-    const u = new URL(ref, baseUrl)
-    if (!u.search && parentQuery) u.search = parentQuery
+    const value = ref.trim()
+    if (!value || /^(data|skd|urn):/i.test(value)) return value
+    const u = new URL(value, baseUrl)
+    // Child playlists and media segments commonly omit Akamai's signed query.
+    // Carry over only missing parent parameters so child-specific values win.
+    for (const [key, val] of baseUrl.searchParams) {
+      if (!u.searchParams.has(key)) u.searchParams.append(key, val)
+    }
     return u.toString()
   }
-  return text
+  return text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
     .split('\n')
     .map(line => {
       const t = line.trim()
       if (!t) return line
-      if (t.startsWith('#')) return line.replace(/URI="([^"]+)"/g, (_, uri) => `URI="${wrap(toAbs(uri))}"`)
+      if (t.startsWith('#')) {
+        return line.replace(/URI=("|')([^"']+)\1/g, (_match, quote: string, uri: string) => {
+          return `URI=${quote}${wrap(toAbs(uri))}${quote}`
+        })
+      }
       return wrap(toAbs(t))
     })
     .join('\n')
@@ -563,6 +580,8 @@ async function handleProxy(
   const ua     = reqUrl.searchParams.get('ua')     || ''
   const via    = reqUrl.searchParams.get('via')    || ''
   const host   = targetUrl.hostname
+  const pathLower = targetUrl.pathname.toLowerCase()
+  const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
 
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
@@ -590,15 +609,13 @@ async function handleProxy(
       cookie,
     )
   }
-  if (rangeHeader) upstreamHeaders.set('Range', rangeHeader)
+  if (rangeHeader && !isManifest) upstreamHeaders.set('Range', rangeHeader)
 
   // ── Fetch strategy ─────────────────────────────────────────────────────────
 
   let upstream: Response | null = null
   let usedProxy = ''
   const needsProxy = needsResidential(host) || geoRequired(host) !== null
-  const pathLower  = targetUrl.pathname.toLowerCase()
-  const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
 
   /** Race direct edge fetch against the proxy pool — first OK response wins. */
   async function raceDirectAndPool(): Promise<void> {
@@ -679,14 +696,12 @@ async function handleProxy(
       // 403 rotate through desktop, mobile-app, and bare profiles via the pool.
       const upstreamRes = upstream as Response | null
       if ((!upstreamRes || !upstreamRes.ok) && isSonyHost(host)) {
-        const profiles = [
+      const profiles = [
           genericHeaders(SONY_MOBILE_UA, SONY_REFERER, SONY_ORIGIN, cookie),
-          genericHeaders(SONY_UA, SONY_REFERER, SONY_ORIGIN, cookie),
           genericHeaders(SONY_MOBILE_UA, '', '', cookie),
-          genericHeaders(DEFAULT_UA, '', '', cookie),
         ]
         for (const profile of profiles) {
-          const hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl)
+          const hit = await findProxy(targetUrl, profile, cookie, ref, ua, relayUrl, '', 6)
           if (hit) { upstream = hit.res; usedProxy = hit.proxy; break }
         }
       }
@@ -743,11 +758,15 @@ async function handleProxy(
 
   if (isDash(path, contentType) || isDashHost(host)) {
     const text      = await upstream.text()
-    const rewritten = rewriteMpd(text, targetUrl, proxyBase, extras)
+    let manifestBase = targetUrl
+    if (!usedProxy && upstream.url) {
+      try { manifestBase = new URL(upstream.url) } catch { /* retain request URL */ }
+    }
+    const rewritten = rewriteMpd(text, manifestBase, proxyBase, extras)
     prefetchSegments(rewritten, cookie, ua || JIO_UA, ref, host, ctx)
     return new Response(rewritten, {
       status: 200,
-      headers: { ...responseHeaders, 'Content-Type': 'application/dash+xml', 'Cache-Control': 'no-cache' },
+      headers: { ...responseHeaders, 'Content-Type': 'application/dash+xml; charset=utf-8', 'Cache-Control': 'no-cache' },
     })
   }
 
@@ -755,11 +774,17 @@ async function handleProxy(
 
   if (isHls(path, contentType)) {
     const text      = await upstream.text()
-    const rewritten = rewritePlaylist(text, targetUrl, proxyBase, extras)
+    // Use the final URL after upstream redirects so relative child paths resolve
+    // against the actual playlist location. Relay responses keep the requested URL.
+    let playlistBase = targetUrl
+    if (!usedProxy && upstream.url) {
+      try { playlistBase = new URL(upstream.url) } catch { /* retain request URL */ }
+    }
+    const rewritten = rewritePlaylist(text, playlistBase, proxyBase, extras)
     prefetchSegments(rewritten, cookie, ua || DEFAULT_UA, ref, host, ctx)
     return new Response(rewritten, {
       status: 200,
-      headers: { ...responseHeaders, 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' },
+      headers: { ...responseHeaders, 'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8', 'Cache-Control': 'no-cache' },
     })
   }
 
