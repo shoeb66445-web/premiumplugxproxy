@@ -36,6 +36,7 @@ const GEO_HOSTS: Record<string, string> = {
   'hotstar.com':                'in',
   'slivcdn.com':                'in',
   'sonydaimenew.akamaized.net': 'in',
+  'fancode.com':                'in',
 }
 
 // Hosts that unconditionally need a residential proxy (CF ASN blocked)
@@ -45,6 +46,7 @@ const NEEDS_RESIDENTIAL = [
   'hotstar.com',
   'jiotvpllive.cdn.jio.com',
   'jiotvmblive.cdn.jio.com',
+  'fancode.com',
 ]
 
 const ALLOWED = [
