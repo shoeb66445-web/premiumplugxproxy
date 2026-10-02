@@ -19,6 +19,8 @@ const HOTSTAR_ORIGIN  = 'https://www.hotstar.com'
 const HOTSTAR_REFERER = 'https://www.hotstar.com/'
 const JIO_ORIGIN      = 'https://www.jio.com'
 const JIO_REFERER     = 'https://www.jio.com/'
+const FANCODE_ORIGIN  = 'https://www.fancode.com'
+const FANCODE_REFERER = 'https://www.fancode.com/'
 
 // ─── Geo-restricted host registry ─────────────────────────────────────────────
 //
@@ -34,6 +36,7 @@ const GEO_HOSTS: Record<string, string> = {
   'hotstar.com':                'in',
   'slivcdn.com':                'in',
   'sonydaimenew.akamaized.net': 'in',
+  'fancode.com':                'in',
 }
 
 // Hosts that unconditionally need a residential proxy (CF ASN blocked)
@@ -43,6 +46,7 @@ const NEEDS_RESIDENTIAL = [
   'hotstar.com',
   'jiotvpllive.cdn.jio.com',
   'jiotvmblive.cdn.jio.com',
+  'fancode.com',
 ]
 
 const ALLOWED = [
@@ -126,6 +130,7 @@ const isSonyHost       = (h: string) => hostMatch(SONY_HOSTS, h)
 const isHotstarHost    = (h: string) => h === 'hotstar.com' || h.endsWith('.hotstar.com')
 const isSlivCDN        = (h: string) => h === 'slivcdn.com' || h.endsWith('.slivcdn.com')
 const isJioHost        = (h: string) => hostMatch(JIO_HOSTS, h)
+const isFanCodeHost    = (h: string) => h === 'fancode.com' || h.endsWith('.fancode.com')
 const isJioMobileCDN   = (h: string) =>
   h === 'jiotvmblive.cdn.jio.com' || h === 'jiotvpllive.cdn.jio.com'
 
@@ -328,6 +333,17 @@ async function timedPoolFetch(
   return { res, ms: Date.now() - t0 }
 }
 
+/** Free relays sometimes answer HTTP 200 with an HTML block/error page. */
+async function isValidHlsManifest(response: Response, targetUrl: URL): Promise<boolean> {
+  if (!targetUrl.pathname.toLowerCase().endsWith('.m3u8')) return true
+  try {
+    const prefix = await response.clone().text()
+    return /^\uFEFF?\s*#EXTM3U(?:\s|$)/.test(prefix)
+  } catch {
+    return false
+  }
+}
+
 async function findProxy(
   targetUrl: URL,
   upstreamHeaders: Headers,
@@ -362,6 +378,7 @@ async function findProxy(
           p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 3500,
         )
         if (!res.ok) throw new Error(String(res.status))
+        if (!(await isValidHlsManifest(res, targetUrl))) throw new Error('Invalid HLS manifest')
         return { proxy: p, res, ms }
       }),
     ).catch(() => null)
@@ -599,6 +616,13 @@ async function handleProxy(
     upstreamHeaders = hotstarHeaders(cookie, effectiveUA, ref)
   } else if (isSonyHost(host)) {
     upstreamHeaders = genericHeaders(ua || SONY_UA, ref || SONY_REFERER, SONY_ORIGIN, cookie)
+  } else if (isFanCodeHost(host)) {
+    upstreamHeaders = genericHeaders(
+      ua || DEFAULT_UA,
+      ref || FANCODE_REFERER,
+      FANCODE_ORIGIN,
+      cookie,
+    )
   } else {
     let refOrigin = targetUrl.origin
     if (ref) { try { refOrigin = new URL(ref).origin } catch { /* keep */ } }
@@ -620,7 +644,11 @@ async function handleProxy(
   /** Race direct edge fetch against the proxy pool — first OK response wins. */
   async function raceDirectAndPool(): Promise<void> {
     const direct = directFetch(targetUrl, upstreamHeaders, isManifest)
-      .then(r => { if (!r.ok) throw new Error(String(r.status)); return { res: r, proxy: '' } })
+      .then(async r => {
+        if (!r.ok) throw new Error(String(r.status))
+        if (!(await isValidHlsManifest(r, targetUrl))) throw new Error('Invalid HLS manifest')
+        return { res: r, proxy: '' }
+      })
     const pooled = findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
       .then(hit => {
         if (!hit) throw new Error('no proxy')
@@ -643,7 +671,7 @@ async function handleProxy(
         const { res, ms } = await timedPoolFetch(
           pinned, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 8000,
         )
-        if (res.ok) {
+        if (res.ok && await isValidHlsManifest(res, targetUrl)) {
           hit = { proxy: pinned, res, ms }
           knownProxies.set(host, { proxy: pinned, ms, at: Date.now() })
         } else {
@@ -725,6 +753,24 @@ async function handleProxy(
 
   if (!upstream) {
     return new Response('No upstream response', { status: 502, headers: corsHeaders() })
+  }
+
+  // A relay can return a branded HTML block page with HTTP 200. Do not wrap it
+  // as a playlist: strict HLS clients report a confusing parse error and retry
+  // indefinitely. Surface a clear upstream failure instead.
+  if (upstream.ok && isManifest && !(await isValidHlsManifest(upstream, targetUrl))) {
+    if (usedProxy && knownProxies.get(host)?.proxy === usedProxy) knownProxies.delete(host)
+    return new Response('Upstream did not return a valid HLS playlist. The source may be blocked, expired, or unavailable.', {
+      status: 502,
+      headers: {
+        ...corsHeaders(),
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Proxy-Upstream': String(upstream.status),
+        'X-Proxy-Upstream-Host': host,
+        'X-Proxy-Upstream-Content-Type': upstream.headers.get('content-type') || 'unknown',
+      },
+    })
   }
 
   const contentType = upstream.headers.get('content-type') || ''
