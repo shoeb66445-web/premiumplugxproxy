@@ -36,7 +36,6 @@ const GEO_HOSTS: Record<string, string> = {
   'hotstar.com':                'in',
   'slivcdn.com':                'in',
   'sonydaimenew.akamaized.net': 'in',
-  'fancode.com':                'in',
 }
 
 // Hosts that unconditionally need a residential proxy (CF ASN blocked)
@@ -46,7 +45,6 @@ const NEEDS_RESIDENTIAL = [
   'hotstar.com',
   'jiotvpllive.cdn.jio.com',
   'jiotvmblive.cdn.jio.com',
-  'fancode.com',
 ]
 
 const ALLOWED = [
@@ -671,7 +669,7 @@ async function handleProxy(
         const { res, ms } = await timedPoolFetch(
           pinned, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 8000,
         )
-        if (res.ok) {
+        if (res.ok && await isValidHlsManifest(res, targetUrl)) {
           hit = { proxy: pinned, res, ms }
           knownProxies.set(host, { proxy: pinned, ms, at: Date.now() })
         } else {
@@ -753,6 +751,24 @@ async function handleProxy(
 
   if (!upstream) {
     return new Response('No upstream response', { status: 502, headers: corsHeaders() })
+  }
+
+  // A relay can return a branded HTML block page with HTTP 200. Do not wrap it
+  // as a playlist: strict HLS clients report a confusing parse error and retry
+  // indefinitely. Surface a clear upstream failure instead.
+  if (upstream.ok && isManifest && !(await isValidHlsManifest(upstream, targetUrl))) {
+    if (usedProxy && knownProxies.get(host)?.proxy === usedProxy) knownProxies.delete(host)
+    return new Response('Upstream did not return a valid HLS playlist. The source may be blocked, expired, or unavailable.', {
+      status: 502,
+      headers: {
+        ...corsHeaders(),
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Proxy-Upstream': String(upstream.status),
+        'X-Proxy-Upstream-Host': host,
+        'X-Proxy-Upstream-Content-Type': upstream.headers.get('content-type') || 'unknown',
+      },
+    })
   }
 
   const contentType = upstream.headers.get('content-type') || ''
