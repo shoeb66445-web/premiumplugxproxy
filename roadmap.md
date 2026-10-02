@@ -1,0 +1,1 @@
+- [ ] Diagnose and fix FanCode HLS proxy failures; test the supplied signed playlist.
