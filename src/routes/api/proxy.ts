@@ -36,22 +36,28 @@ const GEO_HOSTS: Record<string, string> = {
   'hotstar.com':                'in',
   'slivcdn.com':                'in',
   'sonydaimenew.akamaized.net': 'in',
+  'sonymtmnew.akamaized.net':   'in',
   'fancode.com':                'in',
+  'dai.google.com':             'in',
 }
 
 // Hosts that unconditionally need a residential proxy (CF ASN blocked)
 const NEEDS_RESIDENTIAL = [
   'slivcdn.com',
   'sonydaimenew.akamaized.net',
+  'sonymtmnew.akamaized.net',
   'hotstar.com',
   'jiotvpllive.cdn.jio.com',
   'jiotvmblive.cdn.jio.com',
   'fancode.com',
+  'dai.google.com',
 ]
 
 const ALLOWED = [
   'fancode.com',
+  'dai.google.com',
   'akamaized.net',
+  'sonymtmnew.akamaized.net',
   'akamaihd.net',
   'hotstar.com',
   'slivcdn.com',
@@ -118,7 +124,7 @@ const DASH_HOSTS = [
   'jiotvpllive.cdn.jio.com',
 ]
 
-const SONY_HOSTS = ['slivcdn.com', 'sonydaimenew.akamaized.net']
+const SONY_HOSTS = ['slivcdn.com', 'sonydaimenew.akamaized.net', 'sonymtmnew.akamaized.net']
 const JIO_HOSTS  = ['jiotvmblive.cdn.jio.com', 'jiotvpllive.cdn.jio.com', 'jiocinema.com', 'jio.com']
 
 const hostMatch    = (list: string[], h: string) => list.some(s => h === s || h.endsWith('.' + s))
@@ -130,7 +136,8 @@ const isSonyHost       = (h: string) => hostMatch(SONY_HOSTS, h)
 const isHotstarHost    = (h: string) => h === 'hotstar.com' || h.endsWith('.hotstar.com')
 const isSlivCDN        = (h: string) => h === 'slivcdn.com' || h.endsWith('.slivcdn.com')
 const isJioHost        = (h: string) => hostMatch(JIO_HOSTS, h)
-const isFanCodeHost    = (h: string) => h === 'fancode.com' || h.endsWith('.fancode.com')
+const isFanCodeHost    = (h: string) =>
+  h === 'dai.google.com' || h.endsWith('.dai.google.com') || h === 'fancode.com' || h.endsWith('.fancode.com')
 const isJioMobileCDN   = (h: string) =>
   h === 'jiotvmblive.cdn.jio.com' || h === 'jiotvpllive.cdn.jio.com'
 
@@ -490,8 +497,10 @@ function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: 
     const u = new URL(value, baseUrl)
     // Child playlists and media segments commonly omit Akamai's signed query.
     // Carry over only missing parent parameters so child-specific values win.
-    for (const [key, val] of baseUrl.searchParams) {
-      if (!u.searchParams.has(key)) u.searchParams.append(key, val)
+    if (u.hostname === baseUrl.hostname) {
+      for (const [key, val] of baseUrl.searchParams) {
+        if (!u.searchParams.has(key)) u.searchParams.append(key, val)
+      }
     }
     return u.toString()
   }
@@ -501,8 +510,8 @@ function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: 
       const t = line.trim()
       if (!t) return line
       if (t.startsWith('#')) {
-        return line.replace(/URI=("|')([^"']+)\1/g, (_match, quote: string, uri: string) => {
-          return `URI=${quote}${wrap(toAbs(uri))}${quote}`
+        return line.replace(/\b(URI|X-ASSET-LIST)=("|')([^"']+)\2/g, (_match, attribute: string, quote: string, uri: string) => {
+          return `${attribute}=${quote}${wrap(toAbs(uri))}${quote}`
         })
       }
       return wrap(toAbs(t))
@@ -546,7 +555,6 @@ function isDash(path: string, ct: string): boolean {
   return (
     path.endsWith('.mpd') ||
     ct.includes('dash+xml') ||
-    ct.includes('application/xml') ||
     (path.endsWith('.mpd') && ct.includes('octet-stream'))
   )
 }
@@ -739,7 +747,11 @@ async function handleProxy(
       // No geo restriction — straight from CF edge (segments edge-cached)
       upstream = await directFetch(targetUrl, upstreamHeaders, isManifest)
       // If direct gets a geo-block response, fall back to pool automatically
-      if (!upstream.ok && (upstream.status === 403 || upstream.status === 451 || upstream.status === 450)) {
+      const retryableBlock = upstream.status === 400 || upstream.status === 403 || upstream.status === 404 ||
+        upstream.status === 429 || upstream.status === 450 || upstream.status === 451 || upstream.status >= 500
+      const invalidFanCodeManifest = isFanCodeHost(host) && upstream.ok && isManifest &&
+        !(await isValidHlsManifest(upstream, targetUrl))
+      if ((!upstream.ok && (isFanCodeHost(host) ? retryableBlock : [403, 450, 451].includes(upstream.status))) || invalidFanCodeManifest) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
       }
@@ -841,7 +853,11 @@ async function handleProxy(
   respHeaders.delete('content-security-policy')
   respHeaders.delete('content-encoding')
   // Segments are immutable — let browser + edge cache them aggressively
-  respHeaders.set('Cache-Control', 'public, max-age=120, immutable')
+  if (upstream.status === 200) {
+    respHeaders.set('Cache-Control', 'public, max-age=120, immutable')
+  } else {
+    respHeaders.set('Cache-Control', 'no-store')
+  }
   return new Response(upstream.body, { status: upstream.status, headers: respHeaders })
 }
 

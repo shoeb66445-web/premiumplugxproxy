@@ -1,1 +1,4 @@
-- [ ] Diagnose and fix FanCode HLS proxy failures; test the supplied signed playlist.
+- [x] Add FanCode/Google DAI routing, publisher headers, playlist validation, metadata URI rewriting, and safe handling for signed child URLs and range responses.
+- [ ] Verify FanCode playback with a fresh live URL; the supplied signed URL has expired and the CDN returns 403 from this environment.
+- [x] Add the Sony `sonymtmnew.akamaized.net` hostname to Sony routing and playlist rewriting.
+- [ ] Verify Sony playback through the app proxy; the source playlist succeeds via direct cURL but is denied to the app runtime, so an allowed relay/network path is still needed.
