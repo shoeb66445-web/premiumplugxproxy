@@ -55,6 +55,7 @@ const NEEDS_RESIDENTIAL = [
 
 const ALLOWED = [
   'fancode.com',
+  'dai.google.com',
   'akamaized.net',
   'akamaihd.net',
   'hotstar.com',
@@ -508,8 +509,8 @@ function rewritePlaylist(text: string, baseUrl: URL, proxyBase: string, extras: 
       const t = line.trim()
       if (!t) return line
       if (t.startsWith('#')) {
-        return line.replace(/\b(?:URI|X-ASSET-LIST)=("|')([^"']+)\1/g, (_match, quote: string, uri: string) => {
-          return `${_match.split('=')[0]}=${quote}${wrap(toAbs(uri))}${quote}`
+        return line.replace(/\b(URI|X-ASSET-LIST)=("|')([^"']+)\2/g, (_match, attribute: string, quote: string, uri: string) => {
+          return `${attribute}=${quote}${wrap(toAbs(uri))}${quote}`
         })
       }
       return wrap(toAbs(t))
