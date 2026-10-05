@@ -57,6 +57,7 @@ const ALLOWED = [
   'fancode.com',
   'dai.google.com',
   'akamaized.net',
+  'sonymtmnew.akamaized.net',
   'akamaihd.net',
   'hotstar.com',
   'slivcdn.com',
@@ -749,7 +750,9 @@ async function handleProxy(
       // If direct gets a geo-block response, fall back to pool automatically
       const retryableBlock = upstream.status === 400 || upstream.status === 403 || upstream.status === 404 ||
         upstream.status === 429 || upstream.status === 450 || upstream.status === 451 || upstream.status >= 500
-      if (!upstream.ok && (isFanCodeHost(host) ? retryableBlock : [403, 450, 451].includes(upstream.status))) {
+      const invalidFanCodeManifest = isFanCodeHost(host) && upstream.ok && isManifest &&
+        !(await isValidHlsManifest(upstream, targetUrl))
+      if ((!upstream.ok && (isFanCodeHost(host) ? retryableBlock : [403, 450, 451].includes(upstream.status))) || invalidFanCodeManifest) {
         const hit = await findProxy(targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl)
         if (hit) { upstream = hit.res; usedProxy = hit.proxy }
       }
