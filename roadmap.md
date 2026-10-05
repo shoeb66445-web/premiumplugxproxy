@@ -1,1 +1,2 @@
 - [ ] Diagnose and fix FanCode HLS proxy failures; test the supplied signed playlist.
+- [ ] Add support for the supplied Sony Akamai hostname and verify host matching.
