@@ -555,7 +555,6 @@ function isDash(path: string, ct: string): boolean {
   return (
     path.endsWith('.mpd') ||
     ct.includes('dash+xml') ||
-    ct.includes('application/xml') ||
     (path.endsWith('.mpd') && ct.includes('octet-stream'))
   )
 }
