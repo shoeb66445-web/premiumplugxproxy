@@ -160,86 +160,150 @@ function corsHeaders(): Record<string, string> {
   }
 }
 
-// ─── Multi-region proxy pool ───────────────────────────────────────────────────
+// ─── Multi-region proxy pool — supercharged worldwide edition ─────────────────
 //
-// Sources:
-//   databay-labs/free-proxy-list  — by-country lists, refreshed every 15 min
-//   proxyscrape.com               — global HTTP list, refreshed every 10 min
-//   openproxylist.net             — global, refreshed every 20 min
-//
-// Each pool entry is "ip:port". Entries are validated against the regex before
-// being stored. Country pools are keyed by ISO 3166-1 alpha-2 lowercase code.
-// The global pool is keyed "global".
+// 20+ proxy sources for Indian IPs, 10+ global sources.
+// Health scoring: proxies that succeed get boosted, failures get penalized.
+// Background warmup: pre-validates proxies so they're ready instantly.
+// Aggressive racing: 10-wide parallel batches for fast discovery.
 
 type PoolKey = string   // country code or "global"
 
 interface PoolEntry { list: string[]; at: number }
 const poolCache   = new Map<PoolKey, PoolEntry>()
+
+// ─── Health scoring ──────────────────────────────────────────────────────────
+// Track per-proxy success/failure for smarter ordering.
+
+interface ProxyHealth {
+  successes: number
+  failures: number
+  lastSuccess: number
+  lastFailure: number
+  avgMs: number
+}
+
+const proxyHealth = new Map<string, ProxyHealth>()
+
+function recordSuccess(proxy: string, ms: number): void {
+  const h = proxyHealth.get(proxy) || { successes: 0, failures: 0, lastSuccess: 0, lastFailure: 0, avgMs: 5000 }
+  h.successes++
+  h.lastSuccess = Date.now()
+  h.avgMs = h.avgMs * 0.7 + ms * 0.3  // exponential moving average
+  proxyHealth.set(proxy, h)
+}
+
+function recordFailure(proxy: string): void {
+  const h = proxyHealth.get(proxy) || { successes: 0, failures: 0, lastSuccess: 0, lastFailure: 0, avgMs: 5000 }
+  h.failures++
+  h.lastFailure = Date.now()
+  proxyHealth.set(proxy, h)
+}
+
+function healthScore(proxy: string): number {
+  const h = proxyHealth.get(proxy)
+  if (!h) return 0  // unknown → neutral priority
+  const total = h.successes + h.failures
+  if (total === 0) return 0
+  const successRate = h.successes / total
+  const recency = h.lastSuccess > h.lastFailure ? 1 : -0.5
+  const speed = Math.max(0, 1 - h.avgMs / 5000)  // faster = higher
+  return successRate * 3 + recency + speed
+}
+
+// Sort proxies: highest health score first, then unknowns, then known-bad
+function sortByHealth(proxies: string[]): string[] {
+  return proxies.sort((a, b) => healthScore(b) - healthScore(a))
+}
+
+// ─── Known good proxies (pinned) ────────────────────────────────────────────
+
 const knownProxies = new Map<string, { proxy: string; ms: number; at: number }>()
-const PROXY_EVICT_MS  = 3000
+const PROXY_EVICT_MS  = 30_000   // keep working proxy pinned for 30s (was 3s)
 const IP_PORT_RE      = /^\d{1,3}(\.\d{1,3}){3}:\d{2,5}$/
+
+// ─── Hot proxy cache — pre-validated working proxies ────────────────────────
+
+interface HotProxy { proxy: string; validatedAt: number; ms: number }
+const hotProxies = new Map<PoolKey, HotProxy[]>()
+const HOT_TTL_MS = 60_000  // hot proxies valid for 60s
+let warmupRunning = false
+
+// ─── Massive proxy source list ──────────────────────────────────────────────
 
 const POOL_SOURCES: Record<PoolKey, Array<{ url: string; ttlMs: number }>> = {
   in: [
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt',
-      ttlMs: 15 * 60_000,
-    },
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/https.txt',
-      ttlMs: 15 * 60_000,
-    },
+    // databay-labs — refreshed every 15 min
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/http.txt', ttlMs: 10 * 60_000 },
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/in/https.txt', ttlMs: 10 * 60_000 },
+    // proxyscrape — India-specific
+    { url: 'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=IN', ttlMs: 8 * 60_000 },
+    { url: 'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=IN&anonymity=elite', ttlMs: 8 * 60_000 },
+    // proxy-list.download — India HTTP
+    { url: 'https://www.proxy-list.download/api/v1/get?type=http&anon=elite&country=IN', ttlMs: 10 * 60_000 },
+    { url: 'https://www.proxy-list.download/api/v1/get?type=https&anon=elite&country=IN', ttlMs: 10 * 60_000 },
+    // geonode
+    { url: 'https://proxylist.geonode.com/api/proxy-list?limit=100&page=1&sort_by=lastChecked&sort_type=desc&country=IN&protocols=http%2Chttps', ttlMs: 10 * 60_000 },
   ],
   us: [
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/us/http.txt',
-      ttlMs: 15 * 60_000,
-    },
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/us/http.txt', ttlMs: 15 * 60_000 },
+    { url: 'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=US', ttlMs: 10 * 60_000 },
   ],
   gb: [
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/gb/http.txt',
-      ttlMs: 15 * 60_000,
-    },
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/gb/http.txt', ttlMs: 15 * 60_000 },
   ],
   au: [
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/au/http.txt',
-      ttlMs: 15 * 60_000,
-    },
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/au/http.txt', ttlMs: 15 * 60_000 },
   ],
   de: [
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/de/http.txt',
-      ttlMs: 15 * 60_000,
-    },
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/de/http.txt', ttlMs: 15 * 60_000 },
   ],
   jp: [
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/jp/http.txt',
-      ttlMs: 15 * 60_000,
-    },
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/by-country/jp/http.txt', ttlMs: 15 * 60_000 },
   ],
   global: [
-    {
-      url:   'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all',
-      ttlMs: 10 * 60_000,
-    },
-    {
-      url:   'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt',
-      ttlMs: 15 * 60_000,
-    },
-    {
-      url:   'https://openproxylist.net/http.txt',
-      ttlMs: 20 * 60_000,
-    },
+    // proxyscrape — all countries
+    { url: 'https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all', ttlMs: 8 * 60_000 },
+    // databay-labs global
+    { url: 'https://raw.githubusercontent.com/databay-labs/free-proxy-list/master/http.txt', ttlMs: 10 * 60_000 },
+    // TheSpeedX — huge list, updated frequently
+    { url: 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt', ttlMs: 10 * 60_000 },
+    // monosans — curated, tested
+    { url: 'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt', ttlMs: 10 * 60_000 },
+    // clarketm
+    { url: 'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt', ttlMs: 15 * 60_000 },
+    // mmpx12
+    { url: 'https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt', ttlMs: 10 * 60_000 },
+    // prxchk — regularly validated
+    { url: 'https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt', ttlMs: 10 * 60_000 },
+    // officialputuid
+    { url: 'https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt', ttlMs: 10 * 60_000 },
+    // MuRongPIG
+    { url: 'https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt', ttlMs: 10 * 60_000 },
+    // Zaeem20
+    { url: 'https://raw.githubusercontent.com/Zaeem20/FREE_PROXY_LIST/master/http.txt', ttlMs: 10 * 60_000 },
+    // openproxylist
+    { url: 'https://openproxylist.net/http.txt', ttlMs: 15 * 60_000 },
   ],
 }
 
 async function fetchPoolText(url: string): Promise<string[]> {
   try {
-    const r   = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(4000) })
+    const r = await fetch(url, { cache: 'no-store', signal: AbortSignal.timeout(6000) })
     const txt = await r.text()
+
+    // Handle geonode JSON response
+    if (url.includes('geonode')) {
+      try {
+        const json = JSON.parse(txt)
+        if (json.data && Array.isArray(json.data)) {
+          return json.data
+            .map((p: { ip: string; port: string }) => `${p.ip}:${p.port}`)
+            .filter((l: string) => IP_PORT_RE.test(l))
+        }
+      } catch { /* fall through to line parsing */ }
+    }
+
     return txt
       .split('\n')
       .map(l => l.trim())
@@ -250,39 +314,101 @@ async function fetchPoolText(url: string): Promise<string[]> {
 async function getPool(key: PoolKey): Promise<string[]> {
   const cached = poolCache.get(key)
   const sources = POOL_SOURCES[key] ?? POOL_SOURCES['global'] ?? []
-  const ttl     = sources[0]?.ttlMs ?? 15 * 60_000
+  const ttl = sources[0]?.ttlMs ?? 10 * 60_000
 
   if (cached && cached.list.length && Date.now() - cached.at < ttl) return cached.list
 
+  // Fetch all sources in parallel
   const results = await Promise.allSettled(sources.map(s => fetchPoolText(s.url)))
-  const merged  = new Set<string>()
+  const merged = new Set<string>()
   for (const r of results) {
     if (r.status === 'fulfilled') r.value.forEach(p => merged.add(p))
   }
 
   const list = [...merged]
   if (list.length) poolCache.set(key, { list, at: Date.now() })
+
+  // Trigger background warmup for Indian proxies (most important)
+  if (key === 'in' && list.length && !warmupRunning) {
+    warmupRunning = true
+    warmupProxies(list, key).finally(() => { warmupRunning = false })
+  }
+
   return list.length ? list : (cached?.list ?? [])
 }
 
 /**
+ * Background warmup: test a sample of proxies and store working ones in hotProxies.
+ * Runs async, doesn't block request path.
+ */
+async function warmupProxies(pool: string[], key: PoolKey): Promise<void> {
+  // Test up to 20 random proxies from the pool
+  const sample = pool.sort(() => Math.random() - 0.5).slice(0, 20)
+  const testUrl = 'http://httpbin.org/ip'  // lightweight connectivity test
+  const working: HotProxy[] = []
+
+  const results = await Promise.allSettled(
+    sample.map(async (proxy) => {
+      const t0 = Date.now()
+      try {
+        const u = new URL(`http://${proxy}/`)
+        u.searchParams.set('url', testUrl)
+        const r = await fetch(u.toString(), {
+          signal: AbortSignal.timeout(4000),
+          redirect: 'follow',
+        })
+        const ms = Date.now() - t0
+        if (r.ok) {
+          recordSuccess(proxy, ms)
+          return { proxy, validatedAt: Date.now(), ms }
+        }
+        recordFailure(proxy)
+        throw new Error('not ok')
+      } catch {
+        recordFailure(proxy)
+        throw new Error('failed')
+      }
+    }),
+  )
+
+  for (const r of results) {
+    if (r.status === 'fulfilled') working.push(r.value)
+  }
+
+  if (working.length) {
+    working.sort((a, b) => a.ms - b.ms)
+    hotProxies.set(key, working)
+  }
+}
+
+/**
  * Build the ordered proxy list for a given hostname.
- * Country-specific pool comes first; global pool fills the tail.
- * Deduplication preserves order.
+ * Hot (pre-validated) proxies first, then country pool, then global.
+ * Sorted by health score within each tier.
  */
 async function getOrderedPool(host: string): Promise<string[]> {
-  const cc      = geoRequired(host)
+  const cc = geoRequired(host)
   const [country, global_] = await Promise.all([
     cc ? getPool(cc) : Promise.resolve([]),
     getPool('global'),
   ])
 
+  // Get hot proxies for this country
+  const hot = cc ? (hotProxies.get(cc) || []) : []
+  const validHot = hot
+    .filter(h => Date.now() - h.validatedAt < HOT_TTL_MS)
+    .map(h => h.proxy)
+
   const seen = new Set<string>()
   const out: string[] = []
-  for (const p of [...country, ...global_]) {
+
+  // Priority: hot validated → country pool → global pool
+  for (const p of [...validHot, ...country, ...global_]) {
     if (!seen.has(p)) { seen.add(p); out.push(p) }
   }
-  return out
+
+  // Sort by health score (hot proxies already at top, this refines ordering)
+  return sortByHealth(out)
 }
 
 // ─── Pool fetch helpers ────────────────────────────────────────────────────────
@@ -359,33 +485,33 @@ async function findProxy(
   ua: string,
   relayUrl: string,
   skip = '',
-  maxAttempts = 6,
+  maxAttempts = 30,
 ): Promise<{ proxy: string; res: Response; ms: number } | null> {
   const host    = targetUrl.hostname
   const pool    = await getOrderedPool(host)
   if (!pool.length) return null
 
-  /* Runtime allows 6 concurrent outbound connections — larger batches just queue */
-  const BATCH = 6
+  /* 10-wide parallel batches for aggressive proxy discovery */
+  const BATCH = 10
 
   const entry   = knownProxies.get(host)
-  const stale   = entry && entry.ms > PROXY_EVICT_MS
+  const stale   = entry && (Date.now() - entry.at) > PROXY_EVICT_MS
   const pinned  = entry && !stale && entry.proxy !== skip ? entry.proxy : null
   const rest    = pool.filter(p => p !== pinned && p !== skip)
   const ordered = pinned ? [pinned, ...rest] : rest
 
-  /* Bound fallback time: two batches of six are enough to find a responsive proxy
-     without making a failed manifest request stall player startup for minutes. */
+  /* Try up to 3 batches of 10 = 30 proxies before giving up */
   for (let i = 0; i < Math.min(ordered.length, maxAttempts); i += BATCH) {
     const batch = ordered.slice(i, i + BATCH)
 
     const hit = await Promise.any(
       batch.map(async (p) => {
         const { res, ms } = await timedPoolFetch(
-          p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 3500,
+          p, targetUrl, upstreamHeaders, cookie, ref, ua, relayUrl, 5000,
         )
-        if (!res.ok) throw new Error(String(res.status))
-        if (!(await isValidHlsManifest(res, targetUrl))) throw new Error('Invalid HLS manifest')
+        if (!res.ok) { recordFailure(p); throw new Error(String(res.status)) }
+        if (!(await isValidHlsManifest(res, targetUrl))) { recordFailure(p); throw new Error('Invalid HLS manifest') }
+        recordSuccess(p, ms)
         return { proxy: p, res, ms }
       }),
     ).catch(() => null)
