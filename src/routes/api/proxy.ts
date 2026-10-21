@@ -578,6 +578,148 @@ function directFetch(
   return fetch(targetUrl.toString(), init as RequestInit)
 }
 
+// ─── Built-in browser player page ─────────────────────────────────────────────
+// Chrome and Firefox cannot play HLS natively. When a proxied .m3u8 URL is
+// opened directly in a browser (top-level navigation → Accept includes
+// text/html), serve a self-contained hls.js page that plays the same URL.
+// Player-side fetches send Accept: */* and still receive the raw manifest.
+
+function playerPage(host: string): Response {
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${host} — live player</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px;
+    background: radial-gradient(ellipse at center, #111 0%, #000 75%);
+    font-family: system-ui, -apple-system, sans-serif; color: #e5e7eb;
+    transition: opacity .4s; z-index: 2;
+  }
+  #overlay.done { opacity: 0; pointer-events: none; }
+  .spinner {
+    width: 42px; height: 42px; border-radius: 50%;
+    border: 3px solid #333; border-top-color: #f43f5e;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #msg { font-size: 14px; opacity: .85; max-width: 80%; text-align: center; line-height: 1.5; }
+  #err { color: #fb7185; }
+  #unmute {
+    position: fixed; right: 16px; bottom: 16px; z-index: 3; display: none;
+    padding: 8px 14px; border-radius: 999px; border: 1px solid #444;
+    background: rgba(20,20,20,.8); color: #fff; font-size: 13px; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted controls></video>
+<div id="overlay">
+  <div class="spinner"></div>
+  <div id="msg">Connecting to ${host}&hellip;</div>
+</div>
+<button id="unmute">Tap to unmute</button>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js" crossorigin="anonymous"><\/script>
+<script>
+(() => {
+  const v = document.getElementById('v');
+  const overlay = document.getElementById('overlay');
+  const msg = document.getElementById('msg');
+  const unmute = document.getElementById('unmute');
+  const src = window.location.href;
+  let manifestRetries = 0;
+
+  const fail = (text) => {
+    overlay.classList.remove('done');
+    document.querySelector('.spinner').style.display = 'none';
+    msg.innerHTML = '<span id="err">' + text + '</span>';
+  };
+
+  const start = () => {
+    if (!window.Hls || !Hls.isSupported()) {
+      if (v.canPlayType('application/vnd.apple.mpegurl')) {
+        v.src = src;
+        v.addEventListener('loadeddata', () => overlay.classList.add('done'));
+      } else fail('This browser cannot play HLS streams.');
+      return;
+    }
+    const hls = new Hls({
+      enableWorker: true,
+      lowLatencyMode: true,
+      liveSyncDurationCount: 3,
+      backBufferLength: 90,
+      maxBufferLength: 30,
+      fragLoadingMaxRetry: 6,
+      manifestLoadingMaxRetry: 4,
+    });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      overlay.classList.add('done');
+      v.play().catch(() => {});
+      if (v.muted) unmute.style.display = 'block';
+    });
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      console.warn('[player] error', data.type, data.details, data.fatal, (data.response || {}).code);
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+        return;
+      }
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        if (
+          data.details === Hls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+          data.details === Hls.ErrorDetails.MANIFEST_LOAD_TIMEOUT ||
+          data.details === Hls.ErrorDetails.MANIFEST_PARSING_ERROR
+        ) {
+          manifestRetries++;
+          if (manifestRetries > 3) {
+            hls.destroy();
+            fail('Stream unavailable — the link may have expired or the source is blocked.');
+            return;
+          }
+        }
+        hls.startLoad();
+        return;
+      }
+      hls.destroy();
+      fail('Playback failed. Please reload the page.');
+    });
+    hls.loadSource(src);
+    hls.attachMedia(v);
+  };
+
+  v.addEventListener('playing', () => {
+    overlay.classList.add('done');
+    if (v.muted) unmute.style.display = 'block';
+  });
+  unmute.addEventListener('click', () => {
+    v.muted = false;
+    unmute.style.display = 'none';
+  });
+  v.addEventListener('click', () => {
+    if (v.muted) { v.muted = false; unmute.style.display = 'none'; }
+  });
+
+  start();
+})();
+<\/script>
+</body>
+</html>`
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'Content-Type':   'text/html; charset=utf-8',
+      'Cache-Control':  'no-store',
+      'X-Proxy-Player': '1',
+    },
+  })
+}
+
 // ─── Core proxy handler ────────────────────────────────────────────────────────
 
 async function handleProxy(
@@ -607,6 +749,21 @@ async function handleProxy(
   const host   = targetUrl.hostname
   const pathLower = targetUrl.pathname.toLowerCase()
   const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
+
+  // ── Browser navigation → built-in HLS player ───────────────────────────────
+  // A top-level browser navigation to a playlist URL cannot play it natively
+  // (no HLS support in Chrome/Firefox). Serve the hls.js player page instead.
+  // Players requesting the same URL send Accept: */* and bypass this entirely.
+  const accept = request.headers.get('accept') || ''
+  if (
+    isManifest &&
+    pathLower.endsWith('.m3u8') &&
+    !reqUrl.searchParams.has('raw') &&
+    accept.includes('text/html') &&
+    !accept.includes('vnd.apple.mpegurl')
+  ) {
+    return playerPage(host)
+  }
 
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
