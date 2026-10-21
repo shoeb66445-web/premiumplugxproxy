@@ -749,6 +749,21 @@ async function handleProxy(
   const pathLower = targetUrl.pathname.toLowerCase()
   const isManifest = /\.(m3u8|mpd)$/.test(pathLower)
 
+  // ── Browser navigation → built-in HLS player ───────────────────────────────
+  // A top-level browser navigation to a playlist URL cannot play it natively
+  // (no HLS support in Chrome/Firefox). Serve the hls.js player page instead.
+  // Players requesting the same URL send Accept: */* and bypass this entirely.
+  const accept = request.headers.get('accept') || ''
+  if (
+    isManifest &&
+    pathLower.endsWith('.m3u8') &&
+    !reqUrl.searchParams.has('raw') &&
+    accept.includes('text/html') &&
+    !accept.includes('vnd.apple.mpegurl')
+  ) {
+    return playerPage(host)
+  }
+
   const relayUrl     = env?.RESIDENTIAL_RELAY_URL || ''
   const hotstarRelay = env?.HOTSTAR_RELAY          || ''
 
