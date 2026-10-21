@@ -665,6 +665,7 @@ function playerPage(host: string): Response {
       if (v.muted) unmute.style.display = 'block';
     });
     hls.on(Hls.Events.ERROR, (_e, data) => {
+      console.warn('[player] error', data.type, data.details, data.fatal, (data.response || {}).code);
       if (!data.fatal) return;
       if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
         hls.recoverMediaError();
