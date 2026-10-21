@@ -2,10 +2,11 @@
  * /api/slivstream — SonyLiv CORS-bypass streaming endpoint
  *
  * Ported from sony.php v15.0 — gets fresh Sony session cookies via API,
- * rewrites all CDN URLs through /api/proxy for worldwide playback.
+ * fetches master playlist directly from CDN edge, rewrites all URLs
+ * through /api/proxy so clients worldwide can play via browser/VLC/IPTV.
  *
  * Routes:
- *   GET /api/slivstream                → M3U playlist of all channels (proxied)
+ *   GET /api/slivstream                → M3U playlist of all channels
  *   GET /api/slivstream?ch=set-hd      → proxied master.m3u8 for that channel
  *   GET /api/slivstream?ch=set-hd&play → browser player page
  *   GET /api/slivstream?format=json    → JSON channel list
@@ -53,6 +54,8 @@ const API_BASE = 'https://apiv2.sonyliv.com'
 const APP_VER = '3.4.2'
 const SAMPLE_VODS = ['1090491205', '1700001659', '1700000121', '1700000456', '1700001234']
 const SONY_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+const SONY_ORIGIN = 'https://www.sonyliv.com'
+const SONY_REFERER = 'https://www.sonyliv.com/'
 
 interface SonyCookie {
   query: string
@@ -110,7 +113,7 @@ async function getVodUrl(token: string): Promise<string | null> {
 function extractCookie(url: string): SonyCookie | null {
   try {
     const u = new URL(url)
-    const query = u.search.slice(1) // remove leading ?
+    const query = u.search.slice(1)
     if (!query) return null
     let expiry = Math.floor(Date.now() / 1000) + 7200
     const expMatch = /[?&]exp=(\d+)/.exec(url)
@@ -148,51 +151,111 @@ async function getCookie(force = false): Promise<SonyCookie | null> {
 
 function withCk(url: string, cq: string): string {
   if (!cq) return url
-  const base = url.split('?')[0]
-  const existing = new URL(url).searchParams
-  const newParams = new URLSearchParams(cq)
-  for (const [k, v] of newParams) {
-    if (!existing.has(k)) existing.set(k, v)
+  try {
+    const u = new URL(url)
+    const newParams = new URLSearchParams(cq)
+    for (const [k, v] of newParams) {
+      if (!u.searchParams.has(k)) u.searchParams.set(k, v)
+    }
+    return u.toString()
+  } catch {
+    const sep = url.includes('?') ? '&' : '?'
+    return url + sep + cq
   }
-  const qs = existing.toString()
-  return qs ? `${base}?${qs}` : base
 }
 
-// ─── M3U8 rewriter — rewrites all URLs through /api/proxy ────────────────────
+// ─── M3U8 rewriter ───────────────────────────────────────────────────────────
+// Rewrites all URLs in the playlist to go through /api/proxy.
+// The CLIENT (browser/player) will fetch these URLs — NOT the server.
+// This avoids the self-fetch deadlock on Cloudflare Workers.
 
 function resolveUrl(base: string, rel: string): string {
   if (/^https?:\/\//i.test(rel)) return rel
   if (rel.startsWith('//')) return 'https:' + rel
-  try {
-    return new URL(rel, base).toString()
-  } catch {
-    // Manual resolution for edge cases
-    const dir = base.substring(0, base.lastIndexOf('/') + 1)
-    return dir + rel
-  }
+  try { return new URL(rel, base).toString() }
+  catch { return base.substring(0, base.lastIndexOf('/') + 1) + rel }
 }
 
 function rewriteM3u8(body: string, baseUrl: string, proxyBase: string, cookieQuery: string): string {
-  const lines = body.replace(/\r\n/g, '\n').split('\n')
-  return lines.map(line => {
+  const wrap = (absUrl: string) => {
+    const withAuth = withCk(absUrl, cookieQuery)
+    return `${proxyBase}?u=${encodeURIComponent(withAuth)}&ref=${encodeURIComponent(SONY_REFERER)}`
+  }
+
+  return body.replace(/\r\n/g, '\n').split('\n').map(line => {
     const trimmed = line.trim()
     if (!trimmed) return line
 
-    // Rewrite URI= attributes in tags
+    // Rewrite URI= in HLS tags
     if (/^#EXT-X-(?:KEY|MAP|MEDIA|SESSION-DATA|I-FRAME-STREAM-INF|STREAM-INF):/i.test(trimmed)) {
-      return trimmed.replace(/URI="([^"]+)"/g, (_match, uri) => {
-        const abs = withCk(resolveUrl(baseUrl, uri), cookieQuery)
-        return `URI="${proxyBase}?u=${encodeURIComponent(abs)}"`
+      return trimmed.replace(/URI="([^"]+)"/g, (_m, uri) => {
+        return `URI="${wrap(resolveUrl(baseUrl, uri))}"`
       })
     }
 
-    // Skip other comment lines
     if (trimmed[0] === '#') return line
 
-    // Plain URL line (variant or segment)
-    const abs = withCk(resolveUrl(baseUrl, trimmed), cookieQuery)
-    return `${proxyBase}?u=${encodeURIComponent(abs)}`
+    // Plain URL line
+    return wrap(resolveUrl(baseUrl, trimmed))
   }).join('\n')
+}
+
+// ─── Direct CDN fetch (from edge, not via /api/proxy) ────────────────────────
+// Fetches the master playlist directly from slivcdn.
+// This runs server-side on Cloudflare edge. slivcdn may geo-block from
+// non-Indian IPs, but the master playlist (unlike segments) often works
+// globally. If it fails, we return a constructed playlist pointing through
+// /api/proxy which will use the Indian proxy pool for segments.
+
+async function fetchMasterPlaylist(
+  channelUrl: string,
+  cookieQuery: string,
+): Promise<{ body: string; effectiveUrl: string } | null> {
+  const url = withCk(channelUrl, cookieQuery)
+  const headers = new Headers({
+    'User-Agent': SONY_UA,
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Origin': SONY_ORIGIN,
+    'Referer': SONY_REFERER,
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
+    'Cache-Control': 'no-cache',
+  })
+
+  // Try direct fetch first
+  try {
+    const r = await fetch(url, {
+      headers,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(8000),
+    })
+    if (r.ok) {
+      const body = await r.text()
+      if (body.includes('#EXTM3U')) {
+        return { body, effectiveUrl: r.url || url }
+      }
+    }
+  } catch { /* direct failed, try via proxy below */ }
+
+  // Direct fetch failed (geo-block) — return null, we'll build a synthetic playlist
+  return null
+}
+
+// Build a synthetic master playlist that points directly through /api/proxy
+// This is used when we can't fetch the master playlist from edge
+function buildSyntheticMaster(channelUrl: string, cookieQuery: string, proxyBase: string): string {
+  const authedUrl = withCk(channelUrl, cookieQuery)
+  const proxied = `${proxyBase}?u=${encodeURIComponent(authedUrl)}&ref=${encodeURIComponent(SONY_REFERER)}`
+
+  // Return a simple redirect-style master playlist
+  // The /api/proxy endpoint will fetch the actual master, rewrite it, and serve it
+  return `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720
+${proxied}
+`
 }
 
 // ─── CORS headers ────────────────────────────────────────────────────────────
@@ -304,74 +367,43 @@ async function handle(request: Request): Promise<Response> {
 
     // Browser navigation → player page
     if (wantPlay || (accept.includes('text/html') && !accept.includes('mpegurl'))) {
-      const m3u8Url = `${streamBase}?ch=${ch}`
+      // Point hls.js at the raw M3U8 endpoint (not play mode)
+      const m3u8Url = `${streamBase}?ch=${ch}&raw=1`
       return playerPage(channel.name, m3u8Url)
     }
 
     // Get fresh Sony cookie
     const ck = await getCookie()
     if (!ck) {
-      return new Response('# ERROR: Cannot get Sony session', {
+      return new Response('# ERROR: Cannot get Sony session. Retrying...', {
         status: 502,
         headers: { ...corsHeaders(), 'Content-Type': 'text/plain' },
       })
     }
 
-    // Fetch the master playlist from slivcdn via /api/proxy
-    const cdnUrl = withCk(channel.url, ck.query)
-    const proxiedMasterUrl = `${proxyBase}?u=${encodeURIComponent(cdnUrl)}&ref=${encodeURIComponent('https://www.sonyliv.com/')}&raw=1`
+    // Try to fetch master playlist directly from edge
+    const master = await fetchMasterPlaylist(channel.url, ck.query)
 
-    try {
-      const upstream = await fetch(proxiedMasterUrl, {
-        headers: { 'Accept': '*/*', 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(15000),
-      })
-
-      if (!upstream.ok) {
-        // Retry with fresh cookie
-        const freshCk = await getCookie(true)
-        if (freshCk) {
-          const retryUrl = `${proxyBase}?u=${encodeURIComponent(withCk(channel.url, freshCk.query))}&ref=${encodeURIComponent('https://www.sonyliv.com/')}&raw=1`
-          const retry = await fetch(retryUrl, {
-            headers: { 'Accept': '*/*', 'User-Agent': 'Mozilla/5.0' },
-            signal: AbortSignal.timeout(15000),
-          })
-          if (retry.ok) {
-            const body = await retry.text()
-            const effectiveUrl = retry.url || cdnUrl
-            const rewritten = rewriteM3u8(body, effectiveUrl, proxyBase, freshCk.query)
-            return new Response(rewritten, {
-              headers: {
-                ...corsHeaders(),
-                'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
-                'Cache-Control': 'no-cache, no-store',
-              },
-            })
-          }
-        }
-        return new Response(`# Stream fetch failed for ${channel.name} (HTTP ${upstream.status})`, {
-          status: 502,
-          headers: { ...corsHeaders(), 'Content-Type': 'text/plain' },
-        })
-      }
-
-      const body = await upstream.text()
-      const effectiveUrl = upstream.url || cdnUrl
-      const rewritten = rewriteM3u8(body, effectiveUrl, proxyBase, ck.query)
-
-      return new Response(rewritten, {
-        headers: {
-          ...corsHeaders(),
-          'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
-          'Cache-Control': 'no-cache, no-store',
-        },
-      })
-    } catch (e) {
-      return new Response(`# Fetch error: ${(e as Error).message}`, {
-        status: 502,
-        headers: { ...corsHeaders(), 'Content-Type': 'text/plain' },
-      })
+    let responseBody: string
+    if (master) {
+      // Got the real master — rewrite all URLs through /api/proxy
+      responseBody = rewriteM3u8(master.body, master.effectiveUrl, proxyBase, ck.query)
+    } else {
+      // Edge fetch failed (geo-block) — build synthetic playlist
+      // This makes /api/proxy fetch the master + sub-playlists + segments
+      // using the Indian proxy pool
+      responseBody = buildSyntheticMaster(channel.url, ck.query, proxyBase)
     }
+
+    return new Response(responseBody, {
+      headers: {
+        ...corsHeaders(),
+        'Content-Type': 'application/vnd.apple.mpegurl; charset=utf-8',
+        'Cache-Control': 'no-cache, no-store',
+        'X-Sliv-Cookie': ck.expiry > 0 ? 'valid' : 'expired',
+        'X-Sliv-Source': master ? 'direct' : 'proxy',
+      },
+    })
   }
 
   // ── JSON format ────────────────────────────────────────────────────────────
@@ -379,8 +411,9 @@ async function handle(request: Request): Promise<Response> {
   if (format === 'json') {
     const channels = CHANNELS.map(c => ({
       ...c,
-      stream: `${streamBase}?ch=${c.slug}`,
+      stream: `${streamBase}?ch=${c.slug}&raw=1`,
       player: `${streamBase}?ch=${c.slug}&play`,
+      proxy: `${proxyBase}?u=${encodeURIComponent(c.url)}&ref=${encodeURIComponent(SONY_REFERER)}`,
     }))
     return Response.json(
       { count: channels.length, channels },
@@ -397,7 +430,7 @@ async function handle(request: Request): Promise<Response> {
         ` tvg-name="${c.name}"` +
         (c.logo ? ` tvg-logo="${c.logo}"` : '') +
         ` group-title="${c.group}"`
-      return `#EXTINF:-1${attrs},${c.name}\n${streamBase}?ch=${c.slug}`
+      return `#EXTINF:-1${attrs},${c.name}\n${streamBase}?ch=${c.slug}&raw=1`
     }).join('\n') +
     '\n'
 
