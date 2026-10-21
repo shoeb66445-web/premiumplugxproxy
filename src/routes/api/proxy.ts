@@ -659,7 +659,6 @@ function playerPage(host: string): Response {
       manifestLoadingMaxRetry: 4,
     });
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      console.info('[player] manifest parsed');
       overlay.classList.add('done');
       v.play().catch(() => {});
       if (v.muted) unmute.style.display = 'block';
